@@ -1,0 +1,2 @@
+# icon.icons is a macOS icon file.
+# Please use the iconset folder and run: iconutil -c icns iconset -o icon.icons
