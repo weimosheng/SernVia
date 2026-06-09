@@ -35,7 +35,7 @@ SernVia 是一款基于 Tauri v2 构建的 Windows 桌面应用，通过 Windows
 
 ## 🖼️ 截图
 
-<!-- TODO: 添加截图 -->
+![photo](./photo.png)
 
 ## 🛠️ 技术栈
 
