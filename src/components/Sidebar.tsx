@@ -6,6 +6,7 @@ import {
   ListTree,
   Settings,
   ChevronLeft,
+  Image as ImageIcon,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -13,6 +14,7 @@ const navItems = [
   { to: "/", icon: LayoutDashboard, label: "首页" },
   { to: "/stats", icon: BarChart3, label: "统计" },
   { to: "/details", icon: ListTree, label: "详细" },
+  { to: "/review", icon: ImageIcon, label: "回顾" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];
 

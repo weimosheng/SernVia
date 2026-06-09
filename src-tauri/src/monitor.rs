@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use chrono::{Local, Datelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use rusqlite::Connection;
 
 // Known browser process names (used to determine if an app is a browser)
 const BROWSER_PROCESSES: &[&str] = &[
@@ -339,55 +340,37 @@ impl ActivityTracker {
     }
 
     /// Aggregate stats for the last N days (including today)
+    /// Special handling: if days=7, use calendar week (Monday-Sunday)
     pub fn get_stats_by_range(&self, days: u32) -> WeekData {
-        let today = chrono::Local::now();
+        let today = chrono::Local::now().date_naive();
+        
+        let (start_date, end_date) = if days == 7 {
+            // For week view, use calendar week (Monday-Sunday)
+            let weekday = today.weekday().num_days_from_monday();
+            let monday = today - chrono::Duration::days(weekday as i64);
+            let sunday = monday + chrono::Duration::days(6);
+            (monday, sunday)
+        } else {
+            // For other ranges, just use last N days
+            let start_date = today - chrono::Duration::days((days - 1) as i64);
+            (start_date, today)
+        };
+
         let mut all_apps: HashMap<String, AppStats> = HashMap::new();
         let mut all_browsers: HashMap<String, BrowserStats> = HashMap::new();
         let mut day_list: Vec<DaySummary> = Vec::new();
         let mut total_secs: u64 = 0;
 
-        // Include today's in-memory data (if today is within range)
-        if days >= 1 {
-            let current_data = self.data.lock().unwrap().clone();
-            // Always include today even if total_active_secs is 0 —
-            // the current session may hold accumulated time not yet in history
-            if current_data.date == today.format("%Y-%m-%d").to_string() {
+        let mut current = start_date;
+        while current <= end_date {
+            if let Some(day_data) = self.load_daily_data(&current) {
+                let date_str = current.format("%Y-%m-%d").to_string();
                 day_list.push(DaySummary {
-                    date: current_data.date.clone(),
-                    total_secs: current_data.total_active_secs,
-                });
-                total_secs += current_data.total_active_secs;
-                for app in &current_data.apps {
-                    let entry = all_apps.entry(app.name.clone()).or_insert(AppStats {
-                        name: app.name.clone(),
-                        process_name: app.process_name.clone(),
-                        total_secs: 0,
-                        session_count: 0,
-                    });
-                    entry.total_secs += app.total_secs;
-                    entry.session_count += app.session_count;
-                }
-                for br in &current_data.browsers {
-                    let entry = all_browsers.entry(br.domain.clone()).or_insert(BrowserStats {
-                        domain: br.domain.clone(),
-                        title: br.title.clone(),
-                        total_secs: 0,
-                    });
-                    entry.total_secs += br.total_secs;
-                }
-            }
-        }
-
-        // Load archived daily data for the remaining days
-        let max_days = days.saturating_sub(1);
-        for i in 1..=max_days {
-            let date = (today - chrono::Duration::days(i as i64)).format("%Y-%m-%d").to_string();
-            if let Some(day_data) = load_archived_data(&date) {
-                day_list.push(DaySummary {
-                    date: date.clone(),
+                    date: date_str.clone(),
                     total_secs: day_data.total_active_secs,
                 });
                 total_secs += day_data.total_active_secs;
+
                 for app in &day_data.apps {
                     let entry = all_apps.entry(app.name.clone()).or_insert(AppStats {
                         name: app.name.clone(),
@@ -407,6 +390,7 @@ impl ActivityTracker {
                     entry.total_secs += br.total_secs;
                 }
             }
+            current += chrono::Duration::days(1);
         }
 
         // Sort days chronologically
@@ -428,10 +412,22 @@ impl ActivityTracker {
 
     /// Aggregate stats for N days with an offset from today.
     /// offset_days=0 → current period (today), offset_days=1 → yesterday, etc.
+    /// Special handling: if days=7, use calendar week (Monday-Sunday)
     pub fn get_stats_by_range_offset(&self, days: u32, offset_days: u32) -> WeekData {
         let today = chrono::Local::now().date_naive();
         let end_date = today - chrono::Duration::days(offset_days as i64);
-        let start_date = end_date - chrono::Duration::days((days - 1) as i64);
+        
+        let (start_date, end_date) = if days == 7 {
+            // For week view, use calendar week (Monday-Sunday)
+            let weekday = end_date.weekday().num_days_from_monday();
+            let monday = end_date - chrono::Duration::days(weekday as i64);
+            let sunday = monday + chrono::Duration::days(6);
+            (monday, sunday)
+        } else {
+            // For other ranges, just use fixed days
+            let start_date = end_date - chrono::Duration::days((days - 1) as i64);
+            (start_date, end_date)
+        };
 
         let mut all_apps: HashMap<String, AppStats> = HashMap::new();
         let mut all_browsers: HashMap<String, BrowserStats> = HashMap::new();
@@ -1192,3 +1188,482 @@ fn load_archived_data(date_str: &str) -> Option<ActivityData> {
     }
     None
 }
+
+// Tai Data Import
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TaiApp {
+    id: i32,
+    name: String,
+    description: Option<String>,
+    process: Option<String>,
+    file: Option<String>,
+    category_id: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct TaiHoursLog {
+    id: i32,
+    app_id: i32,
+    data_time: NaiveDateTime,
+    time_seconds: i32,
+}
+
+#[derive(Debug, Clone)]
+struct TaiCategory {
+    id: i32,
+    name: String,
+}
+
+pub enum TaiImportMode {
+    ByDuration,
+    ByName,
+    InMiddle,
+}
+
+pub fn import_tai_data(
+    db_path: &str,
+    mode: TaiImportMode,
+    tracker: Option<&ActivityTracker>,
+) -> Result<u32, String> {
+    let today_date = Local::now().date_naive();
+    
+    // Open Tai database
+    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open Tai database: {}", e))?;
+
+    // Load apps
+    let mut apps_stmt = conn
+        .prepare("SELECT ID, Name, Alias, Description, File, CategoryID FROM AppModels")
+        .map_err(|e| format!("Failed to prepare app query: {}", e))?;
+    let apps_iter = apps_stmt
+        .query_map([], |row| {
+            Ok(TaiApp {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(3)?,
+                process: row.get(2)?,
+                file: row.get(4)?,
+                category_id: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("Failed to load apps: {}", e))?;
+    let mut apps_map: HashMap<i32, TaiApp> = HashMap::new();
+    for app in apps_iter {
+        let app = app.map_err(|e| format!("Failed to parse app: {}", e))?;
+        apps_map.insert(app.id, app);
+    }
+
+    // Load categories
+    let mut cats_stmt = conn
+        .prepare("SELECT ID, Name FROM CategoryModels")
+        .map_err(|e| format!("Failed to prepare category query: {}", e))?;
+    let cats_iter = cats_stmt
+        .query_map([], |row| {
+            Ok(TaiCategory {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("Failed to load categories: {}", e))?;
+    let mut cats_map: HashMap<i32, String> = HashMap::new();
+    for cat in cats_iter {
+        let cat = cat.map_err(|e| format!("Failed to parse category: {}", e))?;
+        cats_map.insert(cat.id, cat.name);
+    }
+
+    // Load HoursLogModel
+    let mut logs_stmt = conn
+        .prepare("SELECT ID, AppModelID, DataTime, Time FROM HoursLogModels ORDER BY DataTime ASC")
+        .map_err(|e| format!("Failed to prepare log query: {}", e))?;
+    let logs_iter = logs_stmt
+        .query_map([], |row| {
+            Ok(TaiHoursLog {
+                id: row.get(0)?,
+                app_id: row.get(1)?,
+                data_time: row.get(2)?,
+                time_seconds: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("Failed to load logs: {}", e))?;
+    let mut all_logs = Vec::new();
+    for log in logs_iter {
+        let log = log.map_err(|e| format!("Failed to parse log: {}", e))?;
+        all_logs.push(log);
+    }
+
+    let mut import_count = 0u32;
+    let mut imported_today = false;
+
+    // Group logs by date
+    let mut date_groups: HashMap<NaiveDate, Vec<TaiHoursLog>> = HashMap::new();
+    for log in &all_logs {
+        let date = log.data_time.date();
+        date_groups.entry(date).or_default().push(log.clone());
+    }
+
+    // Process each date
+    let config_dir = get_config_dir();
+    for (date, logs) in date_groups.clone() {
+        let date_str = date.format("%Y-%m-%d").to_string();
+
+        // Load existing date data if exists
+        let mut existing_data = if date == today_date {
+            // For today, load the current activity data first
+            load_activity_data().ok().unwrap_or(ActivityData {
+                date: date_str.clone(),
+                total_active_secs: 0,
+                apps: Vec::new(),
+                browsers: Vec::new(),
+                history: Vec::new(),
+            })
+        } else {
+            // For other days, load from archive
+            load_archived_data(&date_str).unwrap_or(ActivityData {
+                date: date_str.clone(),
+                total_active_secs: 0,
+                apps: Vec::new(),
+                browsers: Vec::new(),
+                history: Vec::new(),
+            })
+        };
+
+        // Track seen Tai entries to avoid duplicates
+        // Use original Tai data info as unique key: (date_str, hour, app_id, duration_seconds
+        let mut seen_tai_entries: std::collections::HashSet<(String, u32, i32, i32)> = std::collections::HashSet::new();
+        
+        // Save original history entries before clearing
+        let mut original_history = Vec::new();
+        for entry in &existing_data.history {
+            original_history.push(entry.clone());
+        }
+        
+        // Track existing Tai imported entries using (app_name, duration_secs, hour)
+        let mut seen_existing_tai: std::collections::HashSet<(String, u64, u32)> = std::collections::HashSet::new();
+        for entry in &original_history {
+            if entry.window_title.contains("[Tai 导入]") {
+                // Extract hour from timestamp for duplicate checking
+                let dt = chrono::Local.timestamp_opt(entry.start_time, 0).single();
+                let hour = dt.map(|d| d.hour()).unwrap_or(0);
+                seen_existing_tai.insert((entry.app_name.clone(), entry.duration_secs, hour));
+            }
+        }
+        
+        // Clear and rebuild
+        let mut new_history: Vec<ActivityEntry> = Vec::new();
+        existing_data.history.clear();
+        existing_data.apps.clear();
+        existing_data.browsers.clear();
+
+        // Process each hour log
+        for hour_log in logs {
+            let app = match apps_map.get(&hour_log.app_id) {
+                Some(a) => a,
+                None => continue,
+            };
+            if hour_log.time_seconds <= 0 {
+                continue;
+            }
+
+            // Generate activity entries
+            let hour_start = hour_log.data_time;
+            let hour_end = hour_start + chrono::Duration::hours(1);
+            let app_name = app.name.clone();
+            let process_name = app
+                .process
+                .clone()
+                .unwrap_or_else(|| app_name.to_string())
+                .to_lowercase();
+            let process_name = if process_name.ends_with(".exe") {
+                process_name.to_string()
+            } else {
+                format!("{}.exe", process_name)
+            };
+
+            let mut is_browser = false;
+            let lower_proc = process_name.to_lowercase();
+            for browser in BROWSER_PROCESSES {
+                if lower_proc.contains(browser) {
+                    is_browser = true;
+                    break;
+                }
+            }
+
+            // Determine where to place the activity in the hour based on mode
+            let (mut start_time, end_time) = match mode {
+                TaiImportMode::ByDuration => {
+                    // Find position in hour sorted by duration
+                    let hour_logs = date_groups[&date]
+                        .iter()
+                        .filter(|l| l.data_time == hour_start)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let mut sorted_hour_logs = hour_logs.clone();
+                    sorted_hour_logs.sort_by(|a, b| b.time_seconds.cmp(&a.time_seconds));
+
+                    let mut offset = 0;
+                    let mut found = false;
+                    for l in sorted_hour_logs {
+                        if l.id == hour_log.id {
+                            found = true;
+                            break;
+                        }
+                        offset += l.time_seconds;
+                    }
+                    if !found {
+                        offset = 0;
+                    }
+                    let start = hour_start + chrono::Duration::seconds(offset as i64);
+                    let end = start + chrono::Duration::seconds(hour_log.time_seconds as i64);
+                    (start, end)
+                }
+                TaiImportMode::ByName => {
+                    let hour_logs = date_groups[&date]
+                        .iter()
+                        .filter(|l| l.data_time == hour_start)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let mut sorted_hour_logs = hour_logs.clone();
+                    sorted_hour_logs.sort_by(|a, b| {
+                        let a_name = apps_map.get(&a.app_id).map(|a| a.name.as_str()).unwrap_or("");
+                        let b_name = apps_map.get(&b.app_id).map(|a| a.name.as_str()).unwrap_or("");
+                        a_name.cmp(b_name)
+                    });
+
+                    let mut offset = 0;
+                    let mut found = false;
+                    for l in sorted_hour_logs {
+                        if l.id == hour_log.id {
+                            found = true;
+                            break;
+                        }
+                        offset += l.time_seconds;
+                    }
+                    if !found {
+                        offset = 0;
+                    }
+                    let start = hour_start + chrono::Duration::seconds(offset as i64);
+                    let end = start + chrono::Duration::seconds(hour_log.time_seconds as i64);
+                    (start, end)
+                }
+                TaiImportMode::InMiddle => {
+                    let total_hour_secs = 3600;
+                    let center_secs = (total_hour_secs - hour_log.time_seconds) / 2;
+                    let start = hour_start + chrono::Duration::seconds(center_secs as i64);
+                    let end = start + chrono::Duration::seconds(hour_log.time_seconds as i64);
+                    (start, end)
+                }
+            };
+
+            // Make sure end doesn't exceed hour boundary
+            if end_time > hour_end {
+                let overflow = end_time - hour_end;
+                start_time = start_time - overflow;
+            }
+
+            // Convert to Unix timestamp
+            let start_ts = chrono::Local
+                .from_local_datetime(&start_time)
+                .single()
+                .unwrap_or_else(|| Local::now())
+                .timestamp();
+            let end_ts = chrono::Local
+                .from_local_datetime(&end_time)
+                .single()
+                .unwrap_or_else(|| Local::now())
+                .timestamp();
+            let duration_secs = (end_ts - start_ts) as u64;
+
+            // Create entry
+            let entry = ActivityEntry {
+                app_name: app_name.clone(),
+                process_name: process_name.clone(),
+                window_title: format!("[Tai 导入] {}", app_name),
+                is_browser,
+                browser_domain: None,
+                start_time: start_ts,
+                end_time: end_ts,
+                duration_secs,
+            };
+
+            // Check for duplicates using original Tai data info, NOT arranged time
+            // First check against current import batch
+            let hour = hour_start.hour();
+            let tai_key = (date_str.clone(), hour, hour_log.app_id, hour_log.time_seconds);
+            if seen_tai_entries.contains(&tai_key) {
+                continue;
+            }
+            
+            // Then check against existing Tai imports in history
+            if seen_existing_tai.contains(&(app_name.clone(), duration_secs, hour)) {
+                continue;
+            }
+
+            seen_tai_entries.insert(tai_key);
+            new_history.push(entry);
+
+            import_count += 1;
+        }
+
+        // Merge original history entries with new entries
+        for entry in original_history {
+            existing_data.history.push(entry);
+        }
+        
+        // Add new imported entries
+        for entry in new_history {
+            existing_data.history.push(entry);
+        }
+
+        // Recalculate total_active_secs and app stats from combined history
+        existing_data.total_active_secs = existing_data.history.iter()
+            .map(|e| e.duration_secs)
+            .sum();
+        
+        // Recalculate app stats from history
+        let mut app_map: std::collections::HashMap<String, (u64, u32, String)> = std::collections::HashMap::new();
+        let mut browser_map: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
+        
+        for entry in &existing_data.history {
+            let stat = app_map.entry(entry.app_name.clone()).or_insert((0, 0, entry.process_name.clone()));
+            stat.0 += entry.duration_secs;
+            stat.1 += 1;
+            
+            if entry.is_browser {
+                if let Some(ref domain) = entry.browser_domain {
+                    let br_stat = browser_map.entry(domain.clone()).or_insert((0, entry.window_title.clone()));
+                    br_stat.0 += entry.duration_secs;
+                }
+            }
+        }
+        
+        existing_data.apps = app_map.into_iter()
+            .map(|(name, (secs, count, proc))| AppStats {
+                name,
+                process_name: proc,
+                total_secs: secs,
+                session_count: count,
+            })
+            .collect();
+        
+        existing_data.browsers = browser_map.into_iter()
+            .map(|(domain, (secs, title))| BrowserStats {
+                domain,
+                title,
+                total_secs: secs,
+            })
+            .collect();
+
+        // Sort by time descending for history
+        existing_data.history.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+        existing_data.apps.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
+
+        // Save as archived file
+        let mut save_path = config_dir.clone();
+        save_path.push(format!("activity_{}.json", date_str));
+
+        let json = serde_json::to_string_pretty(&existing_data)
+            .map_err(|e| format!("Failed to serialize data: {}", e))?;
+
+        std::fs::write(&save_path, &json)
+            .map_err(|e| format!("Failed to save data: {}", e))?;
+
+        // Also save gzip
+        let gz_path = save_path.with_extension("json.gz");
+        if let Ok(f) = std::fs::File::create(&gz_path) {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            let mut encoder = GzEncoder::new(f, Compression::best());
+            let _ = encoder.write_all(json.as_bytes());
+            let _ = encoder.finish();
+        }
+
+        // If this is today's data, also save to activity_data.json
+        if date == today_date {
+            imported_today = true;
+            save_activity_data(&existing_data);
+        }
+    }
+
+    // If we imported today's data and have a tracker, reload it
+    if imported_today {
+        if let Some(t) = tracker {
+            reload_today_data(t);
+        }
+    }
+
+    Ok(import_count)
+}
+
+pub fn reload_today_data(tracker: &ActivityTracker) {
+    if let Ok(loaded) = load_activity_data() {
+        if let Ok(mut data) = tracker.data.lock() {
+            *data = loaded;
+        }
+    }
+}
+
+
+pub fn get_tai_db_tables(db_path: &str) -> Result<Vec<String>, String> {
+    let conn = Connection::open(db_path)
+        .map_err(|e| format!("Failed to open Tai database: {}", e))?;
+    
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .map_err(|e| format!("Failed to prepare table query: {}", e))?;
+    
+    let tables = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| format!("Failed to query tables: {}", e))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| format!("Failed to collect table names: {}", e))?;
+    
+    Ok(tables)
+}
+
+/// 根据时间戳（秒级 unix 时间）查找当时活跃的 app 信息
+/// 会先查当天数据，再回查历史归档日数据
+/// 注意：对于浏览器，只返回应用名称（如 "Microsoft Edge"），不包含域名，
+///       这样所有浏览器截图都会归类到同一个合集中
+pub fn get_activity_at_timestamp(timestamp_secs: i64) -> Option<String> {
+    // 1) 先构造对应日期字符串
+    let naive = DateTime::from_timestamp(timestamp_secs, 0)?.naive_utc();
+    let date_str = naive.format("%Y-%m-%d").to_string();
+    let today = Local::now().format("%Y-%m-%d").to_string();
+
+    // 2) 加载对应日期的 ActivityData（含 history）
+    let data = if date_str == today {
+        load_activity_data().ok()
+    } else {
+        load_archived_data(&date_str)
+    };
+
+    let Some(data) = data else { return None; };
+
+    // 3) 在 history 中查找包含 timestamp 的 entry
+    // ActivityEntry 的 start_time / end_time 是 unix 秒（i64）
+    for entry in &data.history {
+        if entry.start_time <= timestamp_secs && entry.end_time >= timestamp_secs {
+            // 只返回应用名称，不包含浏览器域名
+            // 这样所有同一浏览器的截图都会归类到同一个合集中
+            return Some(entry.app_name.clone());
+        }
+    }
+
+    // 4) 如果在 history 中没找到，但 entry 精度不够，回退到：
+    //    找到与 timestamp 时间最接近的 entry
+    if let Some(entry) = data.history.iter().min_by_key(|e| {
+        let mid = (e.start_time + e.end_time) / 2;
+        (mid - timestamp_secs).unsigned_abs()
+    }) {
+        // 只在距离小于 10 分钟内认为匹配
+        let mid = (entry.start_time + entry.end_time) / 2;
+        if (mid - timestamp_secs).unsigned_abs() < 600 {
+            // 只返回应用名称，不包含浏览器域名
+            return Some(entry.app_name.clone());
+        }
+    }
+
+    None
+}
+
+

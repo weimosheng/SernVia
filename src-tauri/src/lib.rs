@@ -1,5 +1,7 @@
 mod monitor;
 mod windows_api;
+mod screenshot;
+mod screenshot_crypto;
 
 use monitor::ActivityTracker;
 use std::collections::HashMap;
@@ -131,8 +133,210 @@ fn get_default_data_path() -> String {
 }
 
 #[tauri::command]
+fn get_tai_db_tables(db_path: String) -> Result<Vec<String>, String> {
+    monitor::get_tai_db_tables(&db_path)
+}
+
+#[tauri::command]
+fn import_from_tai(db_path: String, mode: String, state: tauri::State<AppState>) -> Result<u32, String> {
+    let import_mode = match mode.as_str() {
+        "name" => monitor::TaiImportMode::ByName,
+        "middle" => monitor::TaiImportMode::InMiddle,
+        _ => monitor::TaiImportMode::ByDuration,
+    };
+    monitor::import_tai_data(&db_path, import_mode, Some(&state.tracker))
+}
+
+#[tauri::command]
+fn is_admin() -> bool {
+    windows_api::is_running_as_admin()
+}
+
+#[tauri::command]
 fn set_data_path(new_path: String) -> Result<(), String> {
     monitor::set_data_path(&new_path)
+}
+
+#[tauri::command]
+fn get_screenshot_enabled() -> bool {
+    screenshot::load_settings().enabled
+}
+
+#[tauri::command]
+fn get_screenshot_interval() -> u64 {
+    screenshot::load_settings().interval_secs
+}
+
+#[tauri::command]
+fn get_screenshots_folder() -> String {
+    screenshot::load_settings().save_folder.to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_screenshots() -> Vec<String> {
+    screenshot::get_screenshots()
+}
+
+#[tauri::command]
+fn set_screenshot_enabled(enabled: bool) {
+    screenshot::set_screenshot_enabled(enabled)
+}
+
+#[tauri::command]
+fn set_screenshot_interval(interval: u64) {
+    screenshot::set_screenshot_interval(interval)
+}
+
+#[tauri::command]
+fn get_monitor_list() -> Vec<screenshot::MonitorInfo> {
+    screenshot::get_monitor_list()
+}
+
+#[tauri::command]
+fn set_selected_monitors(monitors: Vec<usize>) {
+    screenshot::set_selected_monitors(monitors)
+}
+
+#[tauri::command]
+fn get_selected_monitors() -> Vec<usize> {
+    screenshot::get_selected_monitors()
+}
+
+#[tauri::command]
+fn set_layout_mode(mode: String) {
+    screenshot::set_layout_mode(&mode)
+}
+
+#[tauri::command]
+fn get_layout_mode() -> String {
+    screenshot::get_layout_mode()
+}
+
+#[tauri::command]
+fn get_max_storage_mb() -> u64 {
+    screenshot::get_max_storage_mb()
+}
+
+#[tauri::command]
+fn set_max_storage_mb(mb: u64) {
+    screenshot::set_max_storage_mb(mb)
+}
+
+#[tauri::command]
+fn get_storage_usage_mb() -> f64 {
+    let bytes = screenshot::get_total_screenshot_size();
+    (bytes as f64) / (1024.0 * 1024.0)
+}
+
+#[tauri::command]
+fn get_activity_at_timestamp(timestamp_secs: i64) -> Option<String> {
+    monitor::get_activity_at_timestamp(timestamp_secs)
+}
+
+#[tauri::command]
+fn get_collections() -> Vec<screenshot::ScreenshotCollection> {
+    screenshot::get_collections()
+}
+
+#[tauri::command]
+fn create_collection(name: String, auto_app_name: Option<String>) -> String {
+    screenshot::create_collection(&name, auto_app_name)
+}
+
+#[tauri::command]
+fn delete_collection(id: String) -> Result<(), String> {
+    screenshot::delete_collection(&id)
+}
+
+#[tauri::command]
+fn rename_collection(id: String, new_name: String) -> Result<(), String> {
+    screenshot::rename_collection(&id, &new_name)
+}
+
+#[tauri::command]
+fn add_screenshot_to_collection(id: String, screenshot_path: String) -> Result<(), String> {
+    screenshot::add_screenshot_to_collection(&id, &screenshot_path)
+}
+
+#[tauri::command]
+fn remove_screenshot_from_collection(id: String, screenshot_path: String) -> Result<(), String> {
+    screenshot::remove_screenshot_from_collection(&id, &screenshot_path)
+}
+
+#[tauri::command]
+fn get_screenshots_in_collection(id: String) -> Result<Vec<String>, String> {
+    screenshot::get_screenshots_in_collection(&id)
+}
+
+#[tauri::command]
+fn auto_categorize_screenshot(screenshot_path: String, app_name: String) -> String {
+    screenshot::auto_categorize_screenshot(&screenshot_path, &app_name)
+}
+
+#[tauri::command]
+fn set_screenshots_folder(path: String) {
+    screenshot::set_screenshots_folder(&path)
+}
+
+#[tauri::command]
+fn reset_screenshots_folder() {
+    screenshot::reset_screenshots_folder()
+}
+
+#[tauri::command]
+fn get_screenshot_base64(path: String) -> Option<String> {
+    screenshot::get_screenshot_base64(&path).ok()
+}
+
+#[tauri::command]
+fn screenshot_has_password() -> bool {
+    screenshot_crypto::has_password()
+}
+
+#[tauri::command]
+fn screenshot_set_password(password: String) -> Result<(), String> {
+    screenshot_crypto::set_screenshot_password(&password)
+}
+
+#[tauri::command]
+fn screenshot_verify_password(password: String) -> Result<bool, String> {
+    screenshot_crypto::verify_password(&password)
+}
+
+#[tauri::command]
+fn export_screenshot(file_path: String, output_path: String) -> Result<(), String> {
+    screenshot_crypto::decrypt_and_save(&file_path, &output_path)
+}
+
+#[tauri::command]
+fn delete_screenshot(path: String) -> Result<(), String> {
+    screenshot::delete_screenshot(&path)
+}
+
+#[tauri::command]
+fn delete_screenshots(paths: Vec<String>) -> Result<usize, String> {
+    screenshot::delete_screenshots(paths)
+}
+
+#[tauri::command]
+fn clear_all_screenshots() -> Result<(), String> {
+    screenshot::clear_all_screenshots_and_password()
+}
+
+#[tauri::command]
+async fn copy_screenshot_to_clipboard(path: String) -> Result<String, String> {
+    let data = std::fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+    let key = screenshot_crypto::get_or_create_encryption_key()?;
+    let decrypted = if data.len() > 12 {
+        screenshot_crypto::decrypt_data_with_key(&data, &key)?
+    } else {
+        data
+    };
+    
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&decrypted);
+    
+    Ok(b64)
 }
 
 fn start_monitoring(tracker: Arc<ActivityTracker>, _app_handle: tauri::AppHandle) {
@@ -143,6 +347,8 @@ fn start_monitoring(tracker: Arc<ActivityTracker>, _app_handle: tauri::AppHandle
         .unwrap_or_default();
 
     thread::spawn(move || {
+        let mut last_screenshot = 0;
+        
         loop {
             if let Some((title, class_name, process_name)) =
                 windows_api::get_foreground_window_info()
@@ -162,6 +368,13 @@ fn start_monitoring(tracker: Arc<ActivityTracker>, _app_handle: tauri::AppHandle
             let now = chrono::Local::now().timestamp();
             if now % 30 == 0 {
                 tracker.save();
+            }
+            
+            // Take screenshot if enabled and interval has passed
+            let settings = screenshot::load_settings();
+            if settings.enabled && now - last_screenshot >= settings.interval_secs as i64 {
+                let _ = screenshot::take_screenshot();
+                last_screenshot = now;
             }
 
             thread::sleep(Duration::from_secs(1));
@@ -380,6 +593,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .args(["--autostart"])
@@ -442,7 +656,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon])
+        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

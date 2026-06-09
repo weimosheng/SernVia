@@ -6,6 +6,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatDurationShort, getFaviconUrl } from "@/lib/format";
 import { BarChart3, Globe, Monitor, Trophy, Calendar } from "lucide-react";
 import { DatePicker } from "@/components/ui/date-picker";
@@ -281,37 +282,45 @@ export function StatsPage() {
               </div>
               {/* Bars */}
               <div className={`flex-1 min-w-0 ${range === "week" || range === "year" ? "" : "overflow-x-auto overflow-y-visible"}`}>
-                <div className="flex items-end gap-[2px] h-28 pb-1 min-w-fit">
-                {barData.map((bar, barIdx) => {
-                  const maxSecs = Math.max(...barData.map((b) => b.total_secs), 1);
-                  const heightPct = (bar.total_secs / maxSecs) * 100;
-                  const spread = range === "week" || range === "year";
-                  const isSelected = selectedBarIdx === barIdx;
-                  return (
-                    <div key={bar.label}
-                      className={`flex flex-col items-center gap-0 h-full cursor-pointer ${spread ? "flex-1" : "min-w-[24px]"}`}
-                      onClick={() => handleBarClick(barIdx)}
-                      title={`${bar.label}: ${formatDurationShort(bar.total_secs)}`}
-                    >
-                      <div className="flex-1 w-full flex flex-col justify-end min-h-0">
-                        <div
-                          className={`w-full rounded-t transition-colors ${
-                            isSelected
-                              ? "bg-primary"
-                              : "bg-primary/70 hover:bg-primary"
-                          }`}
-                          style={{ height: `${Math.max(heightPct, 3)}%`, maxWidth: spread ? "48px" : undefined, marginInline: spread ? "auto" : undefined }}
-                        />
-                      </div>
-                      <span className={`text-[9px] leading-none mt-0.5 ${isSelected ? "text-primary font-bold" : "text-muted-foreground"}`}>
-                        {bar.label}
-                      </span>
-                    </div>
-                  );
-                })}
+                <TooltipProvider delayDuration={100}>
+                  <div className="flex items-end gap-[2px] h-28 pb-1 min-w-fit">
+                  {barData.map((bar, barIdx) => {
+                    const maxSecs = Math.max(...barData.map((b) => b.total_secs), 1);
+                    const heightPct = (bar.total_secs / maxSecs) * 100;
+                    const spread = range === "week" || range === "year";
+                    const isSelected = selectedBarIdx === barIdx;
+                    return (
+                      <Tooltip key={bar.label}>
+                        <TooltipTrigger asChild>
+                          <div
+                            className={`flex flex-col items-center gap-0 h-full cursor-pointer ${spread ? "flex-1" : "min-w-[24px]"}`}
+                            onClick={() => handleBarClick(barIdx)}
+                          >
+                            <div className="flex-1 w-full flex flex-col justify-end min-h-0">
+                              <div
+                                className={`w-full rounded-t transition-colors ${
+                                  isSelected
+                                    ? "bg-primary"
+                                    : "bg-primary/70 hover:bg-primary"
+                                }`}
+                                style={{ height: `${Math.max(heightPct, 3)}%`, maxWidth: spread ? "48px" : undefined, marginInline: spread ? "auto" : undefined }}
+                              />
+                            </div>
+                            <span className={`text-[9px] leading-none mt-0.5 ${isSelected ? "text-primary font-bold" : "text-muted-foreground"}`}>
+                              {bar.label}
+                            </span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p>{bar.label}: {formatDurationShort(bar.total_secs)}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    );
+                  })}
+                  </div>
+                </TooltipProvider>
               </div>
             </div>
-          </div>
           </CardContent>
         </Card>
       )}

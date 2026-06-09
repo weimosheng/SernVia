@@ -6,18 +6,23 @@ import { StatsPage } from "@/pages/StatsPage";
 import { DetailsPage } from "@/pages/DetailsPage";
 import { AppDetailPage } from "@/pages/AppDetailPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { ReviewPage } from "@/pages/ReviewPage";
+import { ToastProvider } from "@/components/Toast";
 
 function App() {
   return (
-    <Routes>
-      <Route element={<Layout />}>
-        <Route path="/" element={<HomePage />} />
-        <Route path="/stats" element={<StatsPage />} />
-        <Route path="/details/:appName" element={<AppDetailPage />} />
-        <Route path="/details" element={<DetailsPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-      </Route>
-    </Routes>
+    <ToastProvider>
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/" element={<HomePage />} />
+          <Route path="/stats" element={<StatsPage />} />
+          <Route path="/details/:appName" element={<AppDetailPage />} />
+          <Route path="/details" element={<DetailsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/review" element={<ReviewPage />} />
+        </Route>
+      </Routes>
+    </ToastProvider>
   );
 }
 
