@@ -51,14 +51,22 @@ fn get_app_icon(state: tauri::State<AppState>, process_name: String) -> Option<S
             return Some(icon.clone());
         }
     }
-    // Extract icon
+    // Extract icon (this checks running processes, common paths, and registry)
     if let Some(base64) = windows_api::extract_app_icon(&process_name) {
         let mut cache = state.icon_cache.lock().unwrap();
-        cache.insert(process_name, base64.clone());
-        Some(base64)
-    } else {
-        None
+        cache.insert(process_name.clone(), base64.clone());
+        return Some(base64);
     }
+    // Fallback: check known app paths from Tai imports
+    if let Some(exe_path) = monitor::get_app_path(&process_name) {
+        let path = std::path::Path::new(&exe_path);
+        if let Some(icon) = windows_api::extract_icon_from_path(path) {
+            let mut cache = state.icon_cache.lock().unwrap();
+            cache.insert(process_name, icon.clone());
+            return Some(icon);
+        }
+    }
+    None
 }
 
 #[tauri::command]

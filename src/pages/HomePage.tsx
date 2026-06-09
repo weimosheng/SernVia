@@ -7,9 +7,7 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { formatDurationShort } from "@/lib/format";
 import { Clock, Globe, BarChart3, CalendarDays, Monitor } from "lucide-react";
-import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
-} from "recharts";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { CurrentActivity, ActivityData, WeekData, AppStats } from "@/types";
 
 export function HomePage() {
@@ -154,50 +152,70 @@ function HomeWeekContent({ week }: { week: WeekData | null }) {
         </div>
       </div>
 
-      {/* Week Daily Chart - 折线图 */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">每日活跃趋势</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-36">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={week.days.map(d => ({ ...d, label: d.date.slice(5) }))}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fontSize: 12 }}
-                  stroke="hsl(var(--muted-foreground))"
-                />
-                <YAxis
-                  tick={{ fontSize: 12 }}
-                  stroke="hsl(var(--muted-foreground))"
-                  tickFormatter={(v: number) => formatDurationShort(v)}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: "hsl(var(--popover))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "var(--radius)",
-                    fontSize: 13,
-                  }}
-                  labelStyle={{ fontWeight: 600 }}
-                  formatter={(value) => [formatDurationShort(Number(value ?? 0)), "活跃时长"]}
-                  labelFormatter={(label) => `${label}`}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="total_secs"
-                  stroke="hsl(var(--primary))"
-                  strokeWidth={2}
-                  dot={{ fill: "hsl(var(--primary))", r: 4 }}
-                  activeDot={{ r: 6 }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Week Daily Chart - 柱状图 */}
+      {week.days.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <CalendarDays className="h-4 w-4" />
+              每日活跃趋势
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex gap-2">
+              {/* Y-axis labels */}
+              <div className="flex flex-col justify-between shrink-0 py-[2px]" style={{ height: "7rem" }}>
+                {(() => {
+                  const maxSecs = Math.max(...week.days.map((d) => d.total_secs), 1);
+                  const formatAxis = (s: number) => {
+                    if (s >= 3600) return `${Math.round(s / 3600)}h`;
+                    if (s >= 60) return `${Math.round(s / 60)}m`;
+                    return `${s}s`;
+                  };
+                  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => Math.round(maxSecs * f));
+                  return ticks.reverse().map((t, i) => (
+                    <span key={i} className="text-[10px] text-muted-foreground/50 leading-none">
+                      {t > 0 ? formatAxis(t) : ""}
+                    </span>
+                  ));
+                })()}
+              </div>
+              {/* Bars */}
+              <div className="flex-1 min-w-0">
+                <TooltipProvider delayDuration={100}>
+                  <div className="flex items-end gap-[2px] h-28 pb-1">
+                    {week.days.map((day) => {
+                      const maxSecs = Math.max(...week.days.map((d) => d.total_secs), 1);
+                      const heightPct = (day.total_secs / maxSecs) * 100;
+                      const label = day.date.slice(5); // "MM-DD"
+                      return (
+                        <Tooltip key={day.date}>
+                          <TooltipTrigger asChild>
+                            <div className="flex flex-col items-center gap-0 h-full flex-1 cursor-default">
+                              <div className="flex-1 w-full flex flex-col justify-end min-h-0">
+                                <div
+                                  className="w-full rounded-t bg-primary/70 hover:bg-primary transition-colors"
+                                  style={{ height: `${Math.max(heightPct, 3)}%`, maxWidth: "48px", marginInline: "auto" }}
+                                />
+                              </div>
+                              <span className="text-[9px] leading-none mt-0.5 text-muted-foreground">
+                                {label}
+                              </span>
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>{day.date}: {formatDurationShort(day.total_secs)}</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      );
+                    })}
+                  </div>
+                </TooltipProvider>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Week App Usage */}
       <div>

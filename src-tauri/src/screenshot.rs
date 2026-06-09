@@ -636,6 +636,13 @@ pub fn clear_all_screenshots_and_password() -> Result<(), String> {
     new_settings.interval_secs = settings.interval_secs;
     save_settings(&new_settings);
 
+    // 清空所有合集的截图路径
+    let mut collections = load_collections();
+    for c in &mut collections {
+        c.screenshot_paths.clear();
+    }
+    save_collections(&collections);
+
     Ok(())
 }
 
@@ -764,7 +771,10 @@ pub fn remove_screenshot_from_collection(id: &str, screenshot_path: &str) -> Res
 pub fn get_screenshots_in_collection(id: &str) -> Result<Vec<String>, String> {
     let collections = load_collections();
     if let Some(c) = collections.iter().find(|c| c.id == id) {
-        let mut result = c.screenshot_paths.clone();
+        let mut result: Vec<String> = c.screenshot_paths.iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .cloned()
+            .collect();
         result.sort_by(|a, b| b.cmp(a));
         Ok(result)
     } else {

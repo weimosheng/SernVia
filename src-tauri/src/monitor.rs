@@ -208,12 +208,10 @@ impl ActivityTracker {
                 data.total_active_secs += duration;
                 data.history.push(entry.clone());
 
-                // Update app stats
-                if let Some(app) = data.apps.iter_mut().find(|a| a.name == current.app_name) {
+                // Update app stats (match by process_name for consistency with Tai imports)
+                if let Some(app) = data.apps.iter_mut().find(|a| a.process_name == current.process_name) {
                     app.total_secs += duration;
                     app.session_count += 1;
-                    // Update process_name (handles old data where process_name was empty)
-                    app.process_name = current.process_name.clone();
                 } else {
                     data.apps.push(AppStats {
                         name: current.app_name.clone(),
@@ -299,9 +297,25 @@ impl ActivityTracker {
             browsers: Vec::new(),
             history: Vec::new(),
         };
-        // Delete the saved file
+        // Delete today's saved file
         let path = get_data_path();
         let _ = std::fs::remove_file(&path);
+
+        // Delete all archived activity files
+        let config_dir = get_config_dir();
+        if let Ok(entries) = std::fs::read_dir(&config_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.starts_with("activity_") && (fname.ends_with(".json") || fname.ends_with(".json.gz")) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // Also delete known app paths (will be rebuilt on next Tai import)
+        let mut known_paths = config_dir.clone();
+        known_paths.push("known_app_paths.json");
+        let _ = std::fs::remove_file(&known_paths);
 
         let mut current = self.current.lock().unwrap();
         *current = CurrentSession {
@@ -594,9 +608,9 @@ impl ActivityTracker {
         // Aggregate from today's history entries
         // 使用本地时区计算活动归属的小时，避免 UTC 与本地时差导致的错位
         for entry in &data.history {
-            if let Some(dt) = NaiveDateTime::from_timestamp_opt(entry.start_time, 0) {
-                // 转换为本地时间获取小时
-                let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+            if let Some(local_dt) = DateTime::from_timestamp(entry.start_time, 0)
+                .map(|dt| dt.with_timezone(&Local))
+            {
                 let start_hour = local_dt.hour();
                 if start_hour < 24 {
                     hours[start_hour as usize] += entry.duration_secs;
@@ -607,8 +621,9 @@ impl ActivityTracker {
         // Add the current active session
         let current = self.current.lock().unwrap();
         if !current.app_name.is_empty() && current.start_time > 0 {
-            if let Some(dt) = NaiveDateTime::from_timestamp_opt(current.start_time, 0) {
-                let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+            if let Some(local_dt) = DateTime::from_timestamp(current.start_time, 0)
+                .map(|dt| dt.with_timezone(&Local))
+            {
                 let current_hour = local_dt.hour();
                 if current_hour < 24 {
                     hours[current_hour as usize] += current.accumulated;
@@ -842,8 +857,9 @@ impl ActivityTracker {
         if let Some(data) = day_data {
             for entry in &data.history {
                 if entry.app_name != app_name { continue; }
-                if let Some(dt) = NaiveDateTime::from_timestamp_opt(entry.start_time, 0) {
-                    let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                if let Some(local_dt) = DateTime::from_timestamp(entry.start_time, 0)
+                    .map(|dt| dt.with_timezone(&Local))
+                {
                     let start_hour = local_dt.hour();
                     if start_hour < 24 {
                         hours[start_hour as usize] += entry.duration_secs;
@@ -854,8 +870,9 @@ impl ActivityTracker {
             if date == chrono::Local::now().date_naive() {
                 let current = self.current.lock().unwrap();
                 if current.app_name == app_name && current.start_time > 0 {
-                    if let Some(dt) = NaiveDateTime::from_timestamp_opt(current.start_time, 0) {
-                        let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                    if let Some(local_dt) = DateTime::from_timestamp(current.start_time, 0)
+                        .map(|dt| dt.with_timezone(&Local))
+                    {
                         let current_hour = local_dt.hour();
                         if current_hour < 24 {
                             hours[current_hour as usize] += current.accumulated;
@@ -1022,9 +1039,54 @@ fn archive_daily_data(data: &ActivityData) {
 }
 
 /// Get the full file path of a running process by its process name (e.g. "chrome.exe")
+/// Also checks the known app paths database (populated from Tai imports)
 pub fn get_app_path(process_name: &str) -> Option<String> {
+    // First check the known paths cache (from Tai imports)
+    if let Some(path) = get_known_app_path(process_name) {
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+    // Also try without .exe suffix (for legacy known_app_paths records)
+    if process_name.ends_with(".exe") {
+        let without_exe = &process_name[..process_name.len() - 4];
+        if let Some(path) = get_known_app_path(without_exe) {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+    // Fall back to dynamic lookup
     crate::windows_api::get_process_path_by_name(process_name)
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Save a known executable path for an app (from Tai import)
+pub fn save_known_app_path(process_name: &str, exe_path: &str) {
+    let mut paths = load_known_app_paths();
+    paths.insert(process_name.to_lowercase(), exe_path.to_string());
+    
+    let mut file_path = get_config_dir();
+    file_path.push("known_app_paths.json");
+    if let Ok(json) = serde_json::to_string_pretty(&paths) {
+        let _ = std::fs::write(&file_path, json);
+    }
+}
+
+/// Get a known executable path from the Tai import cache
+fn get_known_app_path(process_name: &str) -> Option<String> {
+    let paths = load_known_app_paths();
+    paths.get(&process_name.to_lowercase()).cloned()
+}
+
+fn load_known_app_paths() -> std::collections::HashMap<String, String> {
+    let mut file_path = get_config_dir();
+    file_path.push("known_app_paths.json");
+    if let Ok(content) = std::fs::read_to_string(&file_path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    }
 }
 
 pub fn extract_domain(title: &str) -> Option<String> {
@@ -1269,6 +1331,24 @@ pub fn import_tai_data(
     for app in apps_iter {
         let app = app.map_err(|e| format!("Failed to parse app: {}", e))?;
         apps_map.insert(app.id, app);
+    }
+
+    // Save known executable paths from Tai import for icon/path lookup
+    for (_, app) in &apps_map {
+        if let Some(ref file_path) = app.file {
+            if !file_path.is_empty() {
+                let raw_process = app.process.as_ref()
+                    .unwrap_or(&app.name)
+                    .to_lowercase();
+                // Normalize: ensure .exe suffix, consistent with activity entry creation below
+                let process_name = if raw_process.ends_with(".exe") {
+                    raw_process
+                } else {
+                    format!("{}.exe", raw_process)
+                };
+                save_known_app_path(&process_name, file_path);
+            }
+        }
     }
 
     // Load categories
@@ -1542,7 +1622,9 @@ pub fn import_tai_data(
         let mut browser_map: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
         
         for entry in &existing_data.history {
-            let stat = app_map.entry(entry.app_name.clone()).or_insert((0, 0, entry.process_name.clone()));
+            // Group by process_name for consistency between Tai imports and SernVia monitoring
+            let key = if entry.process_name.is_empty() { &entry.app_name } else { &entry.process_name };
+            let stat = app_map.entry(key.clone()).or_insert((0, 0, entry.process_name.clone()));
             stat.0 += entry.duration_secs;
             stat.1 += 1;
             
@@ -1555,11 +1637,18 @@ pub fn import_tai_data(
         }
         
         existing_data.apps = app_map.into_iter()
-            .map(|(name, (secs, count, proc))| AppStats {
-                name,
-                process_name: proc,
-                total_secs: secs,
-                session_count: count,
+            .map(|(key, (secs, count, proc))| {
+                // Use the best available display name: look for it in history entries with matching process_name
+                let display_name = existing_data.history.iter()
+                    .find(|e| if proc.is_empty() { e.app_name == key } else { e.process_name == proc })
+                    .map(|e| e.app_name.clone())
+                    .unwrap_or(key.clone());
+                AppStats {
+                    name: display_name,
+                    process_name: proc,
+                    total_secs: secs,
+                    session_count: count,
+                }
             })
             .collect();
         
@@ -1643,9 +1732,10 @@ pub fn get_tai_db_tables(db_path: &str) -> Result<Vec<String>, String> {
 /// 注意：对于浏览器，只返回应用名称（如 "Microsoft Edge"），不包含域名，
 ///       这样所有浏览器截图都会归类到同一个合集中
 pub fn get_activity_at_timestamp(timestamp_secs: i64) -> Option<String> {
-    // 1) 先构造对应日期字符串
-    let naive = DateTime::from_timestamp(timestamp_secs, 0)?.naive_utc();
-    let date_str = naive.format("%Y-%m-%d").to_string();
+    // 1) 使用本地时区构造对应日期字符串（活动数据按本地日期保存）
+    let dt = DateTime::from_timestamp(timestamp_secs, 0)?;
+    let local_dt = dt.with_timezone(&Local);
+    let date_str = local_dt.format("%Y-%m-%d").to_string();
     let today = Local::now().format("%Y-%m-%d").to_string();
 
     // 2) 加载对应日期的 ActivityData（含 history）

@@ -362,7 +362,7 @@ pub fn get_process_path_by_name(process_name: &str) -> Option<std::path::PathBuf
     }
 }
 
-fn extract_icon_from_path(path: &std::path::Path) -> Option<String> {
+pub fn extract_icon_from_path(path: &std::path::Path) -> Option<String> {
     let path_str = path.to_string_lossy();
     
     // Check if file exists

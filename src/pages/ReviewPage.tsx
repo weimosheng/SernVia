@@ -24,6 +24,7 @@ import {
   Calendar,
   ArrowLeft,
   ChevronRight,
+  AlertCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -37,7 +38,7 @@ type Screenshot = {
   date: string;      // "YYYY-MM-DD"
   time: string;      // "HH:MM:SS"
   base64?: string;
-  loading?: boolean;
+  loadError?: string; // 加载失败时记录错误信息
 };
 
 type Collection = {
@@ -67,11 +68,11 @@ function parseFilenameDate(filename: string): { date: string; time: string } {
 }
 
 function formatDisplayDate(dateStr: string): string {
-  // dateStr: "YYYY-MM-DD"
-  const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
-  const yesterday = new Date(today.getTime() - 86400000);
-  const yesterdayStr = yesterday.toISOString().slice(0, 10);
+  // dateStr: "YYYY-MM-DD" (本地日期)
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const yesterday = new Date(now.getTime() - 86400000);
+  const yesterdayStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
 
   if (dateStr === todayStr) return `今天 · ${dateStr}`;
   if (dateStr === yesterdayStr) return `昨天 · ${dateStr}`;
@@ -88,6 +89,7 @@ const ScreenshotItem = memo(function ScreenshotItem({
   onCopy,
   onExport,
   onDelete,
+  onRetry,
 }: {
   ss: Screenshot;
   isSelected: boolean;
@@ -97,6 +99,7 @@ const ScreenshotItem = memo(function ScreenshotItem({
   onCopy: () => void;
   onExport: () => void;
   onDelete: () => void;
+  onRetry: () => void;
 }) {
   return (
     <div
@@ -113,17 +116,29 @@ const ScreenshotItem = memo(function ScreenshotItem({
           loading="lazy"
           decoding="async"
         />
+      ) : ss.loadError ? (
+        <div className="w-full h-full flex items-center justify-center bg-red-50 p-2">
+          <div className="flex flex-col items-center gap-2 min-w-0">
+            <AlertCircle className="h-6 w-6 text-red-500 flex-shrink-0" />
+            <button
+              onClick={(e) => { e.stopPropagation(); onRetry(); }}
+              className="text-xs text-red-600 hover:text-red-800 underline whitespace-nowrap"
+            >
+              加载失败，点击重试
+            </button>
+          </div>
+        </div>
       ) : (
-        <div className="w-full h-full flex items-center justify-center text-muted-foreground bg-muted/50">
-          <div className="animate-pulse flex flex-col items-center">
-            <ImageIcon className="h-8 w-8 opacity-30 mb-2" />
-            <div className="text-xs">加载中...</div>
+        <div className="w-full h-full flex items-center justify-center text-muted-foreground bg-muted/50 p-2">
+          <div className="animate-pulse flex flex-col items-center min-w-0">
+            <ImageIcon className="h-8 w-8 opacity-30 mb-2 flex-shrink-0" />
+            <div className="text-xs whitespace-nowrap">加载中...</div>
           </div>
         </div>
       )}
       <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors" />
 
-      <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
         <button
           onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
           className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
@@ -132,7 +147,7 @@ const ScreenshotItem = memo(function ScreenshotItem({
         </button>
       </div>
 
-      <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+      <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 z-10">
         <button
           onClick={(e) => { e.stopPropagation(); onCategorize(); }}
           className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
@@ -163,9 +178,9 @@ const ScreenshotItem = memo(function ScreenshotItem({
         </button>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
-        <p className="text-xs text-white">{ss.date}</p>
-        <p className="text-xs text-white/80">{ss.time}</p>
+      <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/70 to-transparent opacity-0 group-hover:opacity-100 transition-colors min-h-[44px] flex flex-col justify-end z-10">
+        <p className="text-xs text-white whitespace-nowrap overflow-hidden text-ellipsis">{ss.date}</p>
+        <p className="text-xs text-white/80 whitespace-nowrap overflow-hidden text-ellipsis">{ss.time}</p>
       </div>
     </div>
   );
@@ -200,7 +215,9 @@ export function ReviewPage() {
   // ---------- 分页状态（详情页用） ----------
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState<number>(1);
-  const loadedImagesRef = useRef<Set<string>>(new Set());
+  // 加载版本号：每次切换合集/过滤器时递增，用于放弃过期的图片加载结果
+  const loadVersionRef = useRef<number>(0);
+  // 正在加载中的路径集合，防止重复发起 invoke
   const loadingRef = useRef<Set<string>>(new Set());
 
   // ---------- 视图状态 ----------
@@ -211,27 +228,49 @@ export function ReviewPage() {
   const { showToast } = useToast();
 
   // ---------- 懒加载图片 ----------
-  // 注意：这里用 ref 跟踪正在加载和已加载的图片，避免重复请求
   const loadImages = useCallback(async (items: Screenshot[]) => {
-    const itemsToLoad = items.filter(ss =>
-      !loadedImagesRef.current.has(ss.path) && !loadingRef.current.has(ss.path)
-    );
-    if (itemsToLoad.length === 0) return;
+    const version = loadVersionRef.current;
+    // 过滤出还没有 base64 且未在加载中的图片
+    const toLoad = items.filter(ss => !ss.base64 && !loadingRef.current.has(ss.path));
+    if (toLoad.length === 0) return;
+
+    // 标记为加载中 + 清除之前的错误
+    for (const ss of toLoad) {
+      loadingRef.current.add(ss.path);
+    }
+    setScreenshots(prev => {
+      let changed = false;
+      const next = prev.map(s => {
+        if (toLoad.some(t => t.path === s.path) && s.loadError) {
+          changed = true;
+          return { ...s, loadError: undefined };
+        }
+        return s;
+      });
+      return changed ? next : prev;
+    });
 
     const batch = 8;
-    for (let i = 0; i < itemsToLoad.length; i += batch) {
-      const chunk = itemsToLoad.slice(i, i + batch);
+    for (let i = 0; i < toLoad.length; i += batch) {
+      if (loadVersionRef.current !== version) return;
+      const chunk = toLoad.slice(i, i + batch);
       await Promise.all(chunk.map(async (ss) => {
-        loadingRef.current.add(ss.path);
+        if (loadVersionRef.current !== version) return;
         try {
           const base64 = await invoke<string>("get_screenshot_base64", { path: ss.path });
-          loadedImagesRef.current.add(ss.path);
+          if (loadVersionRef.current !== version) return;
           setScreenshots(prev => {
-            if (!prev.find(s => s.path === ss.path)) return prev;
+            const item = prev.find(s => s.path === ss.path);
+            if (!item || item.base64) return prev;
             return prev.map(s => s.path === ss.path ? { ...s, base64 } : s);
           });
         } catch (e) {
           console.error("Failed to load image:", e);
+          setScreenshots(prev => {
+            const item = prev.find(s => s.path === ss.path);
+            if (!item || item.base64 || item.loadError) return prev;
+            return prev.map(s => s.path === ss.path ? { ...s, loadError: String(e) } : s);
+          });
         } finally {
           loadingRef.current.delete(ss.path);
         }
@@ -246,7 +285,8 @@ export function ReviewPage() {
       const files = f.kind === "collection"
         ? await invoke<string[]>("get_screenshots_in_collection", { id: f.id })
         : await invoke<string[]>("get_screenshots");
-      loadedImagesRef.current.clear();
+      // 递增版本号：丢弃旧批次的加载；清空加载中记录
+      loadVersionRef.current += 1;
       loadingRef.current.clear();
 
       const data: Screenshot[] = (files || []).map((path) => {
@@ -258,10 +298,8 @@ export function ReviewPage() {
       data.sort((a, b) => b.filename.localeCompare(a.filename));
       setScreenshots(data);
       setCurrentPage(1);
-      return data;
     } catch (e) {
       console.error("Failed to load screenshots", e);
-      return [] as Screenshot[];
     } finally {
       setLoading(false);
     }
@@ -369,6 +407,10 @@ export function ReviewPage() {
     setViewerOpen(true);
   };
 
+  const handleRetryOne = (ss: Screenshot) => {
+    loadImages([ss]);
+  };
+
   const handleExport = async (ss?: Screenshot) => {
     const target = ss || currentScreenshot;
     if (!target) return;
@@ -450,7 +492,7 @@ export function ReviewPage() {
     try {
       const count = await invoke<number>('delete_screenshots', { paths: pathsToDelete });
       showToast(`已删除 ${count} 张截图`, 'success');
-      pathsToDelete.forEach(p => loadedImagesRef.current.delete(p));
+      pathsToDelete.forEach(p => loadingRef.current.delete(p));
       setScreenshots(prev => prev.filter(s => !filenamesToDelete.includes(s.filename)));
       setSelectedScreenshots(new Set());
       setIsMultiSelectMode(false);
@@ -613,11 +655,21 @@ export function ReviewPage() {
   const pageEnd = Math.min(pageStart + pageSize, detailScreenshots.length);
   const pageScreenshots = detailScreenshots.slice(pageStart, pageEnd);
 
+  // ---------- 加载状态计数 ----------
+  const loadStatus = useMemo(() => {
+    const visible = displayMode === "detail" ? pageScreenshots : 
+      dayGroups.flatMap(g => g.items.slice(0, TIMELINE_THUMBNAIL_COUNT));
+    const loaded = visible.filter(s => !!s.base64).length;
+    const errors = visible.filter(s => !s.base64 && !!s.loadError).length;
+    const pending = visible.filter(s => !s.base64 && !s.loadError).length;
+    return { loaded, errors, pending, total: visible.length };
+  }, [dayGroups, displayMode, pageScreenshots]);
+
   // 进入详情页：当前页图片加载
   useEffect(() => {
     if (!passwordVerified || displayMode !== "detail" || pageScreenshots.length === 0) return;
     loadImages(pageScreenshots);
-  }, [passwordVerified, displayMode, selectedDate, currentPage, pageSize, loadImages]);
+  }, [passwordVerified, displayMode, pageScreenshots, loadImages]);
 
   // ---------- 视图路由 ----------
   const enterDetail = (date: string) => {
@@ -697,6 +749,26 @@ export function ReviewPage() {
               ? "按日期浏览您的屏幕记录，点击某天查看全部截图"
               : "分页查看当天的截图记录"}
           </p>
+          {!isMultiSelectMode && loadStatus.total > 0 && (
+            <div className="flex items-center gap-3 mt-1.5 text-xs text-muted-foreground">
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-green-500 inline-block" />
+                已加载 {loadStatus.loaded}
+              </span>
+              {loadStatus.pending > 0 && (
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse inline-block" />
+                  加载中 {loadStatus.pending}
+                </span>
+              )}
+              {loadStatus.errors > 0 && (
+                <span className="inline-flex items-center gap-1 text-red-500">
+                  <AlertCircle className="h-3 w-3" />
+                  失败 {loadStatus.errors}
+                </span>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex gap-2 flex-wrap">
           {isMultiSelectMode ? (
@@ -937,6 +1009,7 @@ export function ReviewPage() {
                                 onCopy={() => copyToClipboard(ss)}
                                 onExport={() => handleExport(ss)}
                                 onDelete={() => { setCurrentScreenshot(ss); setDeleteConfirmOpen(true); }}
+                                onRetry={() => handleRetryOne(ss)}
                               />
                             ))}
                             {g.items.length > TIMELINE_THUMBNAIL_COUNT && (
@@ -997,6 +1070,7 @@ export function ReviewPage() {
                       onCopy={() => copyToClipboard(ss)}
                       onExport={() => handleExport(ss)}
                       onDelete={() => { setCurrentScreenshot(ss); setDeleteConfirmOpen(true); }}
+                      onRetry={() => handleRetryOne(ss)}
                     />
                   ))}
                 </div>

@@ -9,8 +9,10 @@ import { Settings, Monitor, Trash2, Download, Info, ExternalLink, Loader2, Folde
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
+import { useToast } from "@/components/Toast";
 
 export function SettingsPage() {
+  const { showToast } = useToast();
   const [exporting, setExporting] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -225,15 +227,13 @@ export function SettingsPage() {
   };
 
   const handleClear = async () => {
-    if (!window.confirm("确定要清除所有统计数据吗？此操作不可恢复！")) {
-      return;
-    }
     setClearing(true);
     try {
       await invoke("clear_data");
-      alert("数据已清除");
+      showToast("数据已清除", "success");
     } catch (err) {
       console.error("Clear failed:", err);
+      showToast("清除失败：" + err, "error");
     } finally {
       setClearing(false);
     }
@@ -793,17 +793,14 @@ export function SettingsPage() {
               size="sm"
               className="flex items-center gap-1"
               onClick={async () => {
-                if (!window.confirm("确定要清除所有截图和密码吗？此操作不可恢复！")) {
-                  return;
-                }
                 try {
                   await invoke("clear_all_screenshots");
-                  alert("截图和密码已清除");
+                  showToast("截图和密码已清除", "success");
                   // 刷新页面
                   window.location.reload();
                 } catch (err) {
                   console.error("Clear screenshots failed:", err);
-                  alert("清除失败：" + err);
+                  showToast("清除失败：" + err, "error");
                 }
               }}
             >
