@@ -1,4 +1,4 @@
-import { useEffect, useState, createContext, useContext } from 'react';
+import { useState, createContext, useContext } from 'react';
 import { X } from 'lucide-react';
 
 type ToastType = 'success' | 'error' | 'info';

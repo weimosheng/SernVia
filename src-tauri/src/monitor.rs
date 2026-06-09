@@ -592,20 +592,27 @@ impl ActivityTracker {
         let mut hours = vec![0u64; 24];
 
         // Aggregate from today's history entries
+        // 使用本地时区计算活动归属的小时，避免 UTC 与本地时差导致的错位
         for entry in &data.history {
-            let start_hour = ((entry.start_time as u64) % 86400) / 3600;
-            if start_hour < 24 {
-                hours[start_hour as usize] += entry.duration_secs;
+            if let Some(dt) = NaiveDateTime::from_timestamp_opt(entry.start_time, 0) {
+                // 转换为本地时间获取小时
+                let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                let start_hour = local_dt.hour();
+                if start_hour < 24 {
+                    hours[start_hour as usize] += entry.duration_secs;
+                }
             }
         }
 
         // Add the current active session
         let current = self.current.lock().unwrap();
         if !current.app_name.is_empty() && current.start_time > 0 {
-            let now = chrono::Local::now().timestamp();
-            let current_hour = ((now as u64) % 86400) / 3600;
-            if current_hour < 24 {
-                hours[current_hour as usize] += current.accumulated;
+            if let Some(dt) = NaiveDateTime::from_timestamp_opt(current.start_time, 0) {
+                let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                let current_hour = local_dt.hour();
+                if current_hour < 24 {
+                    hours[current_hour as usize] += current.accumulated;
+                }
             }
         }
 
@@ -677,10 +684,16 @@ impl ActivityTracker {
         let day_data = self.load_daily_data(&date);
 
         if let Some(data) = day_data {
-            // Calculate hour boundaries (matching get_hourly_bar_data's UTC approach)
-            let day_start_ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
-            let hour_start_ts = day_start_ts + (hour as i64) * 3600;
-            let hour_end_ts = day_start_ts + ((hour + 1) as i64) * 3600;
+            // Calculate hour boundaries in local time, then convert to unix timestamps.
+            // Previously used UTC-style modulo, causing timezone offset mismatch.
+            let hour_start_naive = date.and_hms_opt(hour, 0, 0).unwrap_or_else(|| date.and_hms_opt(0, 0, 0).unwrap());
+            let hour_end_naive = if hour < 23 {
+                date.and_hms_opt(hour + 1, 0, 0).unwrap_or_else(|| hour_start_naive)
+            } else {
+                (date + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap_or_else(|| hour_start_naive)
+            };
+            let hour_start_ts = chrono::Local.from_local_datetime(&hour_start_naive).single().map(|d: DateTime<Local>| d.timestamp()).unwrap_or(0);
+            let hour_end_ts = chrono::Local.from_local_datetime(&hour_end_naive).single().map(|d: DateTime<Local>| d.timestamp()).unwrap_or(0);
 
             // Filter history entries that overlap with this hour
             let mut filtered_history: Vec<ActivityEntry> = Vec::new();
@@ -829,19 +842,24 @@ impl ActivityTracker {
         if let Some(data) = day_data {
             for entry in &data.history {
                 if entry.app_name != app_name { continue; }
-                let start_hour = ((entry.start_time as u64) % 86400) / 3600;
-                if start_hour < 24 {
-                    hours[start_hour as usize] += entry.duration_secs;
+                if let Some(dt) = NaiveDateTime::from_timestamp_opt(entry.start_time, 0) {
+                    let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                    let start_hour = local_dt.hour();
+                    if start_hour < 24 {
+                        hours[start_hour as usize] += entry.duration_secs;
+                    }
                 }
             }
             // Also check current session if today
             if date == chrono::Local::now().date_naive() {
                 let current = self.current.lock().unwrap();
                 if current.app_name == app_name && current.start_time > 0 {
-                    let now = chrono::Local::now().timestamp();
-                    let current_hour = ((now as u64) % 86400) / 3600;
-                    if current_hour < 24 {
-                        hours[current_hour as usize] += current.accumulated;
+                    if let Some(dt) = NaiveDateTime::from_timestamp_opt(current.start_time, 0) {
+                        let local_dt: DateTime<Local> = DateTime::from_utc(dt, Local::now().offset().clone());
+                        let current_hour = local_dt.hour();
+                        if current_hour < 24 {
+                            hours[current_hour as usize] += current.accumulated;
+                        }
                     }
                 }
             }

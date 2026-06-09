@@ -7,7 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Settings, Monitor, Trash2, Download, Info, ExternalLink, Loader2, FolderOpen, RotateCcw, Power, Image as ImageIcon } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 
@@ -320,8 +319,7 @@ export function SettingsPage() {
     });
     if (selected && typeof selected === "string") {
       // Try to find data.db in the directory
-      const path = require("path");
-      const dbPath = path.join(selected, "Data", "data.db");
+      const dbPath = `${selected}\\Data\\data.db`;
       setSelectedTaiDb(dbPath);
       // First get list of tables
       try {
