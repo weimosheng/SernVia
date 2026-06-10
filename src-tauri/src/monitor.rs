@@ -115,7 +115,7 @@ pub struct CurrentSession {
 }
 
 /// Get the number of days in a given month of a given year
-fn get_days_in_month(year: i32, month: u32) -> u32 {
+pub fn get_days_in_month(year: i32, month: u32) -> u32 {
     if month == 12 {
         chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
     } else {
@@ -778,6 +778,12 @@ impl ActivityTracker {
         })
     }
 
+    /// Public helper: load activity data for an arbitrary date.
+    /// Used by the categories/lib modules to aggregate data.
+    pub fn get_activity_for_naive_date(&self, date: &chrono::NaiveDate) -> Option<ActivityData> {
+        self.load_daily_data(date)
+    }
+
     /// Get stats for a specific hour (0-23) of a specific day (offset_days from today).
     pub fn get_stats_for_hour(&self, offset_days: u32, hour: u32) -> ActivityData {
         let date = chrono::Local::now().date_naive() - chrono::Duration::days(offset_days as i64);
@@ -893,6 +899,70 @@ impl ActivityTracker {
                 browsers: Vec::new(),
                 history: Vec::new(),
             }
+        }
+    }
+
+    /// Get history entries for cloud sync, by scope and optional count.
+    /// scope: "today" | "last_n" | "this_week" | "none"
+    /// Returns (entries, total_count)
+    pub fn get_history_entries_for_sync(&self, scope: &str, count: u32) -> (Vec<ActivityEntry>, usize) {
+        let today = chrono::Local::now().date_naive();
+
+        match scope {
+            "today" => {
+                // Just today's history from memory
+                let mut entries = Vec::new();
+                if let Ok(data) = self.data.lock() {
+                    entries = data.history.clone();
+                    entries.reverse();
+                }
+                let total = entries.len();
+                (entries, total)
+            }
+            "this_week" => {
+                // Calendar week (Monday-Sunday)
+                let weekday = today.weekday().num_days_from_monday();
+                let monday = today - chrono::Duration::days(weekday as i64);
+                let sunday = monday + chrono::Duration::days(6);
+
+                let mut all_entries: Vec<ActivityEntry> = Vec::new();
+                let mut current = monday;
+                while current <= sunday {
+                    if let Some(day_data) = self.load_daily_data(&current) {
+                        let mut day_entries = day_data.history.clone();
+                        day_entries.reverse();
+                        all_entries.extend(day_entries);
+                    }
+                    current += chrono::Duration::days(1);
+                }
+                let total = all_entries.len();
+                (all_entries, total)
+            }
+            "last_n" => {
+                // Collect entries from recent days, newest first, up to `count`
+                let mut all_entries: Vec<ActivityEntry> = Vec::new();
+                let mut current = today;
+                let max_days_back = 90u32; // scan up to 90 days
+
+                for _ in 0..max_days_back {
+                    if all_entries.len() >= count as usize {
+                        break;
+                    }
+                    if let Some(day_data) = self.load_daily_data(&current) {
+                        let needed = count as usize - all_entries.len();
+                        let mut day_entries = day_data.history.clone();
+                        day_entries.reverse();
+                        // Take only needed entries from this day
+                        let take: Vec<ActivityEntry> = day_entries.into_iter().take(needed).collect();
+                        all_entries.extend(take);
+                    }
+                    current -= chrono::Duration::days(1);
+                }
+
+                let total = all_entries.len();
+                (all_entries, total)
+            }
+            _ => (Vec::new(), 0),
         }
     }
 
@@ -1105,6 +1175,89 @@ impl ActivityTracker {
             total_secs: secs,
         }).collect()
     }
+
+    /// Get per-process total seconds for a single archived day.
+    /// Used by the categories module to build stacked-bar data.
+    pub fn get_daily_app_stats_for_date(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> std::collections::HashMap<String, u64> {
+        let mut result: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Some(data) = self.load_daily_data(&date) {
+            for app in &data.apps {
+                let proc = if app.process_name.is_empty() {
+                    app.name.to_lowercase()
+                } else {
+                    app.process_name.to_lowercase()
+                };
+                *result.entry(proc).or_insert(0) += app.total_secs;
+            }
+        }
+        result
+    }
+
+    /// Get per-process total seconds for a single hour on a specific date.
+    /// Used by the categories module to build hourly stacked-bar data.
+    pub fn get_hourly_app_stats_for_date(
+        &self,
+        date: chrono::NaiveDate,
+        hour: u32,
+    ) -> std::collections::HashMap<String, u64> {
+        use chrono::{DateTime, Local, TimeZone};
+        let mut result: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let Some(data) = self.load_daily_data(&date) else { return result; };
+
+        let hour_start_naive = date.and_hms_opt(hour, 0, 0)
+            .unwrap_or_else(|| date.and_hms_opt(0, 0, 0).unwrap());
+        let hour_end_naive = if hour < 23 {
+            date.and_hms_opt(hour + 1, 0, 0).unwrap_or_else(|| hour_start_naive)
+        } else {
+            (date + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap_or_else(|| hour_start_naive)
+        };
+        let hour_start_ts = Local.from_local_datetime(&hour_start_naive).single()
+            .map(|d: DateTime<Local>| d.timestamp()).unwrap_or(0);
+        let hour_end_ts = Local.from_local_datetime(&hour_end_naive).single()
+            .map(|d: DateTime<Local>| d.timestamp()).unwrap_or(0);
+
+        for entry in &data.history {
+            if entry.start_time < hour_end_ts && entry.end_time > hour_start_ts {
+                let overlap_start = std::cmp::max(entry.start_time, hour_start_ts);
+                let overlap_end = std::cmp::min(entry.end_time, hour_end_ts);
+                let duration = (overlap_end - overlap_start) as u64;
+                if duration == 0 { continue; }
+
+                let proc = if entry.process_name.is_empty() {
+                    entry.app_name.to_lowercase()
+                } else {
+                    entry.process_name.to_lowercase()
+                };
+                *result.entry(proc).or_insert(0) += duration;
+            }
+        }
+
+        // Include current in-progress session if this is today's hour.
+        let today = chrono::Local::now().date_naive();
+        if date == today {
+            let current = self.current.lock().unwrap();
+            if !current.app_name.is_empty() && current.start_time > 0 {
+                let now = chrono::Local::now().timestamp();
+                if current.start_time < hour_end_ts && now > hour_start_ts {
+                    let overlap_start = std::cmp::max(current.start_time, hour_start_ts);
+                    let overlap_end = std::cmp::min(now, hour_end_ts);
+                    let duration = (overlap_end - overlap_start) as u64;
+                    if duration > 0 {
+                        let proc = if current.process_name.is_empty() {
+                            current.app_name.to_lowercase()
+                        } else {
+                            current.process_name.to_lowercase()
+                        };
+                        *result.entry(proc).or_insert(0) += duration;
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 fn archive_daily_data(data: &ActivityData) {
@@ -1227,7 +1380,7 @@ pub fn extract_domain(title: &str) -> Option<String> {
     Some(clean_title)
 }
 
-fn get_config_dir() -> std::path::PathBuf {
+pub fn get_config_dir() -> std::path::PathBuf {
     let base = std::env::var("APPDATA")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());

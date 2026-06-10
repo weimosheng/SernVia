@@ -601,6 +601,90 @@ pub fn get_screenshot_base64(path: &str) -> Result<String, String> {
     super::screenshot_crypto::decrypt_to_base64(path)
 }
 
+/// Structure for sync screenshot info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncScreenshotInfo {
+    pub path: String,
+    pub date: String, // YYYY-MM-DD
+    pub timestamp: i64,
+}
+
+/// Get screenshots for cloud sync, filtered by scope and count.
+/// scope: "today" | "last_n" | "this_week"
+/// Filename format: YYYY_MM_DD_HH_MM_SS.ssv
+pub fn get_screenshots_for_sync(scope: &str, count: u32) -> Vec<SyncScreenshotInfo> {
+    let all = get_screenshots();
+    let today = chrono::Local::now().date_naive();
+
+    let mut filtered: Vec<SyncScreenshotInfo> = Vec::new();
+
+    for path_str in all {
+        // Extract filename without extension
+        let path = std::path::Path::new(&path_str);
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Parse YYYY_MM_DD_HH_MM_SS => timestamp
+        let parts: Vec<&str> = stem.split('_').collect();
+        if parts.len() < 6 { continue; }
+        let (y, m, d, h, min, s) = (
+            parts[0].parse::<i32>().unwrap_or(0),
+            parts[1].parse::<u32>().unwrap_or(0),
+            parts[2].parse::<u32>().unwrap_or(0),
+            parts[3].parse::<u32>().unwrap_or(0),
+            parts[4].parse::<u32>().unwrap_or(0),
+            parts[5].parse::<u32>().unwrap_or(0),
+        );
+        let date = match chrono::NaiveDate::from_ymd_opt(y, m, d) {
+            Some(d) => d,
+            None => continue,
+        };
+        let time = match chrono::NaiveTime::from_hms_opt(h, min, s) {
+            Some(t) => t,
+            None => continue,
+        };
+        let dt = match chrono::NaiveDateTime::new(date, time)
+            .and_local_timezone(chrono::Local)
+            .single()
+        {
+            Some(dt) => dt,
+            None => continue,
+        };
+        let ts = dt.timestamp();
+
+        let should_include = match scope {
+            "today" => date == today,
+            "this_week" => {
+                let weekday = today.weekday().num_days_from_monday();
+                let monday = today - chrono::Duration::days(weekday as i64);
+                let sunday = monday + chrono::Duration::days(6);
+                date >= monday && date <= sunday
+            }
+            _ => true, // "last_n" or others
+        };
+
+        if should_include {
+            filtered.push(SyncScreenshotInfo {
+                path: path_str,
+                date: date.format("%Y-%m-%d").to_string(),
+                timestamp: ts,
+            });
+        }
+    }
+
+    // Sort by timestamp descending (newest first)
+    filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Apply count limit for "last_n"
+    if scope == "last_n" && (count as usize) < filtered.len() {
+        filtered.truncate(count as usize);
+    }
+
+    filtered
+}
+
 pub fn delete_screenshot(path: &str) -> Result<(), String> {
     std::fs::remove_file(path).map_err(|e| e.to_string())
 }

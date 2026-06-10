@@ -2,12 +2,14 @@ mod monitor;
 mod windows_api;
 mod screenshot;
 mod screenshot_crypto;
+mod categories;
 
 use monitor::ActivityTracker;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use chrono::Datelike;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -599,6 +601,787 @@ fn map_to_app_name(process_name: &str, _class_name: &str, _title: &str) -> Strin
     }
 }
 
+// ============== Cloud Sync ==============
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServerConfig {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub is_official: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoginSession {
+    pub server_id: String,
+    pub server_url: String,
+    pub token: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub device_id: String,
+}
+
+fn get_cloud_config_dir() -> std::path::PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push("SernVia");
+    std::fs::create_dir_all(&path).ok();
+    path
+}
+
+fn get_cloud_config_path() -> std::path::PathBuf {
+    get_cloud_config_dir().join("cloud_config.json")
+}
+
+fn get_login_session_path() -> std::path::PathBuf {
+    get_cloud_config_dir().join("login_session.json")
+}
+
+fn load_server_list() -> Vec<ServerConfig> {
+    let path = get_cloud_config_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_server_list(servers: &[ServerConfig]) -> Result<(), String> {
+    let path = get_cloud_config_path();
+    let json = serde_json::to_string_pretty(servers).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_login_session() -> Option<LoginSession> {
+    let path = get_login_session_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).ok()
+    } else {
+        None
+    }
+}
+
+fn save_login_session(session: &LoginSession) -> Result<(), String> {
+    let path = get_login_session_path();
+    let json = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn delete_login_session() {
+    let path = get_login_session_path();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tauri::command]
+fn get_cloud_server_list() -> Vec<ServerConfig> {
+    load_server_list()
+}
+
+#[tauri::command]
+fn add_cloud_server(name: String, url: String) -> Result<ServerConfig, String> {
+    let mut servers = load_server_list();
+    
+    // Check if URL already exists
+    if servers.iter().any(|s| s.url == url) {
+        return Err("该服务器地址已存在".to_string());
+    }
+    
+    let server = ServerConfig {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        url: url.trim_end_matches('/').to_string(),
+        is_official: false,
+    };
+    
+    servers.push(server.clone());
+    save_server_list(&servers)?;
+    
+    Ok(server)
+}
+
+#[tauri::command]
+fn remove_cloud_server(server_id: String) -> Result<(), String> {
+    let mut servers = load_server_list();
+    servers.retain(|s| s.id != server_id);
+    save_server_list(&servers)?;
+    
+    // If this was the current logged in server, clear session
+    if let Some(session) = load_login_session() {
+        if session.server_id == server_id {
+            delete_login_session();
+        }
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+fn get_login_session() -> Option<LoginSession> {
+    load_login_session()
+}
+
+#[tauri::command]
+fn save_session(server_id: String, server_url: String, token: String, user_id: String, display_name: String, device_id: String) -> Result<(), String> {
+    let session = LoginSession {
+        server_id,
+        server_url,
+        token,
+        user_id,
+        display_name,
+        device_id,
+    };
+    save_login_session(&session)
+}
+
+#[tauri::command]
+fn clear_session() {
+    delete_login_session();
+}
+
+// ============ Cloud Sync HTTP Commands ============
+
+fn make_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Login to a cloud server
+#[tauri::command]
+async fn cloud_http_login(server_url: String, username: String, password: String) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/auth/login", base);
+    let client = make_http_client();
+    let body = serde_json::json!({ "username": username, "password": password });
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                format!("无法连接到 {}\n请确认服务器已启动、地址正确、防火墙未阻止", url)
+            } else if e.is_timeout() {
+                format!("请求 {}\n超时，请检查服务器状态", url)
+            } else {
+                format!("请求 {} 失败: {}", url, e)
+            }
+        })?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+}
+
+/// Register on a cloud server
+#[tauri::command]
+async fn cloud_http_register(server_url: String, username: String, password: String, confirm_password: String) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/auth/register", base);
+    let client = make_http_client();
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+        "confirm_password": confirm_password,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                format!("无法连接到 {}\n请确认服务器已启动、地址正确、防火墙未阻止", url)
+            } else {
+                format!("请求 {} 失败: {}", url, e)
+            }
+        })?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+}
+
+/// Register device on a cloud server
+#[tauri::command]
+async fn cloud_http_register_device(server_url: String, token: String, device_name: String, platform: String) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/devices/register", base);
+    let client = make_http_client();
+    let body = serde_json::json!({
+        "device_name": device_name,
+        "platform": platform,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求 {} 失败: {}", url, e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+}
+
+/// Test connection to a cloud server
+#[tauri::command]
+async fn cloud_http_test(server_url: String) -> Result<bool, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/health", base);
+    let client = make_http_client();
+
+    match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(response) => Ok(response.status().is_success()),
+        Err(e) => Err(format!("连接 {} 失败: {}", url, e)),
+    }
+}
+
+/// Push activity entries to cloud server
+#[tauri::command]
+async fn cloud_http_push_activity(server_url: String, token: String, device_id: String, entries: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/activity/push", base);
+    let client = make_http_client();
+
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "entries": entries,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("上传活动记录失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// Pull activity entries from other devices
+#[tauri::command]
+async fn cloud_http_pull_activity(server_url: String, token: String, device_id: String, from_time: i64) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/activity/pull?device_id={}&from_time={}&limit=500", base, device_id, from_time);
+    let client = make_http_client();
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("拉取活动记录失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// Get list of user's registered devices
+#[tauri::command]
+async fn cloud_http_get_devices(server_url: String, token: String) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/devices", base);
+    let client = make_http_client();
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("获取设备列表失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// Push categories and assignments to cloud server
+#[tauri::command]
+async fn cloud_http_push_categories(
+    server_url: String,
+    token: String,
+    device_id: String,
+    categories: Vec<serde_json::Value>,
+    assignments: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/categories/push", base);
+    let client = make_http_client();
+
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "categories": categories,
+        "assignments": assignments,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("推送分类失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// Pull categories and assignments from cloud server
+#[tauri::command]
+async fn cloud_http_pull_categories(
+    server_url: String,
+    token: String,
+    device_id: String,
+    last_sync_time: i64,
+) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/categories/pull", base);
+    let client = make_http_client();
+
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "last_sync_time": last_sync_time,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("拉取分类失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
+/// Get activity history entries for cloud sync, with scope and count
+#[tauri::command]
+fn get_activity_entries_for_sync(state: tauri::State<AppState>, scope: String, count: u32) -> (Vec<serde_json::Value>, usize) {
+    let (entries, total) = state.tracker.get_history_entries_for_sync(&scope, count);
+    let json_entries: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "app_name": e.app_name,
+                "process_name": e.process_name,
+                "window_title": e.window_title,
+                "is_browser": e.is_browser,
+                "browser_domain": e.browser_domain,
+                "start_time": e.start_time,
+                "end_time": e.end_time,
+                "duration_secs": e.duration_secs,
+            })
+        })
+        .collect();
+    (json_entries, total)
+}
+
+/// Get screenshot paths for cloud sync, with scope and count
+#[tauri::command]
+fn get_screenshots_for_sync(scope: String, count: u32) -> Vec<screenshot::SyncScreenshotInfo> {
+    screenshot::get_screenshots_for_sync(&scope, count)
+}
+
+/// Get category-aware bar data. Each bar is split into per-category segments
+/// so the frontend can render a stacked bar chart.
+#[tauri::command]
+fn get_category_bar_data(
+    state: tauri::State<AppState>,
+    range: String,
+    offset_days: u32,
+) -> Vec<categories::CategoryBarEntry> {
+    categories::build_category_bar_data(&state.tracker, &range, offset_days)
+}
+
+/// App list with user-configured alias and category decoration.
+/// Used by the details page so rows display the user's preferred name & color.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AppWithMeta {
+    name: String,
+    process_name: String,
+    total_secs: u64,
+    session_count: u32,
+    alias: Option<String>,
+    category_id: Option<String>,
+    category_name: Option<String>,
+    category_color: Option<String>,
+}
+
+#[tauri::command]
+fn get_apps_with_meta(
+    state: tauri::State<AppState>,
+    range: String,
+    offset_days: u32,
+) -> Vec<AppWithMeta> {
+    // Collect apps across the requested range.
+    let tracker = &state.tracker;
+    let today = chrono::Local::now().date_naive()
+        - chrono::Duration::days(offset_days as i64);
+    let mut aggregated: HashMap<String, AppWithMeta> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    match range.as_str() {
+        "day" => {
+            if let Some(day_data) = tracker.get_activity_for_naive_date(&today) {
+                for app in &day_data.apps {
+                    let key = if app.process_name.is_empty() {
+                        app.name.to_lowercase()
+                    } else {
+                        app.process_name.to_lowercase()
+                    };
+                    aggregated.entry(key.clone()).and_modify(|existing| {
+                        existing.total_secs += app.total_secs;
+                        existing.session_count += app.session_count;
+                    }).or_insert_with(|| {
+                        order.push(key);
+                        AppWithMeta {
+                            name: app.name.clone(),
+                            process_name: app.process_name.clone(),
+                            total_secs: app.total_secs,
+                            session_count: app.session_count,
+                            alias: None,
+                            category_id: None,
+                            category_name: None,
+                            category_color: None,
+                        }
+                    });
+                }
+            }
+        }
+        "week" => {
+            let weekday = today.weekday().num_days_from_monday();
+            let monday = today - chrono::Duration::days(weekday as i64);
+            for i in 0..7 {
+                let date = monday + chrono::Duration::days(i);
+                if let Some(day_data) = tracker.get_activity_for_naive_date(&date) {
+                    for app in &day_data.apps {
+                        let key = if app.process_name.is_empty() {
+                            app.name.to_lowercase()
+                        } else {
+                            app.process_name.to_lowercase()
+                        };
+                        aggregated.entry(key.clone()).and_modify(|existing| {
+                            existing.total_secs += app.total_secs;
+                            existing.session_count += app.session_count;
+                        }).or_insert_with(|| {
+                            order.push(key);
+                            AppWithMeta {
+                                name: app.name.clone(),
+                                process_name: app.process_name.clone(),
+                                total_secs: app.total_secs,
+                                session_count: app.session_count,
+                                alias: None,
+                                category_id: None,
+                                category_name: None,
+                                category_color: None,
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        "month" => {
+            let (year, month) = (today.year(), today.month());
+            let days = monitor::get_days_in_month(year, month);
+            for d in 1..=days {
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, d) {
+                    if let Some(day_data) = tracker.get_activity_for_naive_date(&date) {
+                        for app in &day_data.apps {
+                            let key = if app.process_name.is_empty() {
+                                app.name.to_lowercase()
+                            } else {
+                                app.process_name.to_lowercase()
+                            };
+                            aggregated.entry(key.clone()).and_modify(|existing| {
+                                existing.total_secs += app.total_secs;
+                                existing.session_count += app.session_count;
+                            }).or_insert_with(|| {
+                                order.push(key);
+                                AppWithMeta {
+                                    name: app.name.clone(),
+                                    process_name: app.process_name.clone(),
+                                    total_secs: app.total_secs,
+                                    session_count: app.session_count,
+                                    alias: None,
+                                    category_id: None,
+                                    category_name: None,
+                                    category_color: None,
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        "year" => {
+            let year = today.year();
+            for m in 1..=12 {
+                let days = monitor::get_days_in_month(year, m);
+                for d in 1..=days {
+                    if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, m, d) {
+                        if let Some(day_data) = tracker.get_activity_for_naive_date(&date) {
+                            for app in &day_data.apps {
+                                let key = if app.process_name.is_empty() {
+                                    app.name.to_lowercase()
+                                } else {
+                                    app.process_name.to_lowercase()
+                                };
+                                aggregated.entry(key.clone()).and_modify(|existing| {
+                                    existing.total_secs += app.total_secs;
+                                    existing.session_count += app.session_count;
+                                }).or_insert_with(|| {
+                                    order.push(key);
+                                    AppWithMeta {
+                                        name: app.name.clone(),
+                                        process_name: app.process_name.clone(),
+                                        total_secs: app.total_secs,
+                                        session_count: app.session_count,
+                                        alias: None,
+                                        category_id: None,
+                                        category_name: None,
+                                        category_color: None,
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // Default: same as today.
+            if let Some(day_data) = tracker.get_activity_for_naive_date(&today) {
+                for app in &day_data.apps {
+                    let key = if app.process_name.is_empty() {
+                        app.name.to_lowercase()
+                    } else {
+                        app.process_name.to_lowercase()
+                    };
+                    aggregated.insert(key.clone(), AppWithMeta {
+                        name: app.name.clone(),
+                        process_name: app.process_name.clone(),
+                        total_secs: app.total_secs,
+                        session_count: app.session_count,
+                        alias: None,
+                        category_id: None,
+                        category_name: None,
+                        category_color: None,
+                    });
+                    order.push(key);
+                }
+            }
+        }
+    }
+
+    // Enrich with user's category / alias assignments.
+    let assignment_map = categories::get_assignment_map();
+    let categories_list = categories::get_categories();
+    let cat_lookup: HashMap<String, categories::Category> = categories_list
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+
+    let mut result: Vec<AppWithMeta> = order.into_iter().filter_map(|k| aggregated.remove(&k)).collect();
+    for app in &mut result {
+        let key = if app.process_name.is_empty() {
+            app.name.to_lowercase()
+        } else {
+            app.process_name.to_lowercase()
+        };
+        if let Some((cat_id, alias)) = assignment_map.get(&key) {
+            app.alias = alias.clone();
+            app.category_id = cat_id.clone();
+            if let Some(cat) = cat_id.as_ref().and_then(|id| cat_lookup.get(id)) {
+                app.category_name = Some(cat.name.clone());
+                app.category_color = Some(cat.color.clone());
+            }
+        }
+    }
+    result.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
+    result
+}
+
+/// Upload a single screenshot file to cloud server
+/// Reads the local encrypted screenshot file, decrypts it, and uploads via multipart/form-data
+#[tauri::command]
+async fn cloud_http_upload_screenshot(
+    server_url: String,
+    token: String,
+    device_id: String,
+    screenshot_path: String,
+    capture_time: i64,
+    app_name: Option<String>,
+    window_title: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/screenshots/upload", base);
+    let client = make_http_client();
+
+    // Read and decrypt the screenshot file
+    let data = std::fs::read(&screenshot_path).map_err(|e| format!("读取截图文件失败: {}", e))?;
+
+    // Decrypt if encrypted (files starting with nonce header)
+    let decrypted = if data.len() > 12 {
+        match screenshot_crypto::get_or_create_encryption_key()
+            .and_then(|key| screenshot_crypto::decrypt_data_with_key(&data, &key))
+        {
+            Ok(plain) => plain,
+            Err(_) => data.clone(), // fallback: use raw data if decryption fails
+        }
+    } else {
+        data.clone()
+    };
+
+    // Calculate SHA-256 hash of file content
+    let file_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&decrypted);
+        let result = hasher.finalize();
+        result.iter().map(|b| format!("{:02x}", b)).collect::<Vec<String>>().join("")
+    };
+
+    let file_size = decrypted.len() as i64;
+
+    // Build multipart form body
+    let filename = std::path::Path::new(&screenshot_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("screenshot_{}.png", capture_time));
+
+    let part = reqwest::multipart::Part::bytes(decrypted)
+        .file_name(filename.clone())
+        .mime_str("image/png")
+        .map_err(|e| format!("构建上传内容失败: {}", e))?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("device_id", device_id.clone())
+        .text("file_hash", file_hash.clone())
+        .text("capture_time", capture_time.to_string())
+        .text("file_size", file_size.to_string())
+        .part("file", part);
+
+    if let Some(app) = app_name {
+        form = form.text("app_name", app);
+    }
+    if let Some(title) = window_title {
+        form = form.text("window_title", title);
+    }
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("上传截图失败: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("解析响应失败: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let tracker = Arc::new(ActivityTracker::new());
@@ -610,6 +1393,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_http::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .args(["--autostart"])
@@ -675,7 +1459,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, change_screenshot_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot])
+        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, change_screenshot_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot, get_cloud_server_list, add_cloud_server, remove_cloud_server, get_login_session, save_session, clear_session, cloud_http_login, cloud_http_register, cloud_http_register_device, cloud_http_test, cloud_http_push_activity, cloud_http_pull_activity, cloud_http_get_devices, cloud_http_upload_screenshot, cloud_http_push_categories, cloud_http_pull_categories, get_activity_entries_for_sync, get_screenshots_for_sync, get_category_bar_data, get_apps_with_meta, categories::cmd_get_categories, categories::cmd_add_category, categories::cmd_update_category, categories::cmd_delete_category, categories::cmd_get_assignments, categories::cmd_set_app_category, categories::cmd_set_app_alias, categories::cmd_remove_app_assignment, categories::cmd_replace_categories_store])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

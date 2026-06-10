@@ -10,7 +10,20 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { formatDurationShort, getFaviconUrl } from "@/lib/format";
 import { BarChart3, Globe, Monitor, Trophy, Calendar } from "lucide-react";
 import { DatePicker } from "@/components/ui/date-picker";
-import type { AppStats, BrowserStats, WeekData, BarEntry, ActivityData } from "@/types";
+import type { AppStats, BrowserStats, WeekData, ActivityData } from "@/types";
+
+// Category-aware bar data (used in stacked-bar chart on Stats page)
+interface BarSegment {
+  category_id: string | null;
+  category_name: string | null;
+  category_color: string | null;
+  secs: number;
+}
+interface CategoryBarEntry {
+  label: string;
+  total_secs: number;
+  segments: BarSegment[];
+}
 
 type TimeRange = "day" | "week" | "month" | "year";
 
@@ -69,19 +82,75 @@ export function StatsPage() {
   const [range, setRange] = useState<TimeRange>("day");
   const [offsetDays, setOffsetDays] = useState(0);
   const [stats, setStats] = useState<WeekData | null>(null);
-  const [barData, setBarData] = useState<BarEntry[]>([]);
+  const [barData, setBarData] = useState<CategoryBarEntry[]>([]);
+
+  // Global list of categories that actually appear in the data, with consistent colors
+  // Each entry: { id, name, color, total_secs }
+  // Uncategorised (id = null) is treated as a regular "category" for rendering purposes.
+  const [categoryLegend, setCategoryLegend] = useState<
+    { id: string | null; name: string; color: string; total_secs: number }[]
+  >([]);
 
   const [selectedBarIdx, setSelectedBarIdx] = useState<number | null>(null);
   const [filteredData, setFilteredData] = useState<ActivityData | null>(null);
+
+  // Default colour for uncategorised. Categories themselves carry a `category_color`
+  // from the backend, which we use when provided (falls back to this palette otherwise).
+  const FALLBACK_COLORS = [
+    "#3b82f6", "#ef4444", "#f59e0b", "#10b981", "#8b5cf6",
+    "#ec4899", "#06b6d4", "#f97316", "#6366f1", "#14b8a6",
+  ];
+  const UNCATEGORIZED_COLOR = "#94a3b8";
 
   const fetchData = useCallback(async () => {
     try {
       const [data, bars] = await Promise.all([
         invoke<WeekData>("get_stats_by_range_offset", { days: RANGE_DAYS[range], offsetDays, range }),
-        invoke<BarEntry[]>("get_bar_data_offset", { range, offsetDays }),
+        invoke<CategoryBarEntry[]>("get_category_bar_data", { range, offsetDays }),
       ]);
       setStats(data);
       setBarData(bars);
+
+      // Build the legend: walk all segments, collect unique category IDs,
+      // and sum total seconds per category across all bars for ordering.
+      const byId = new Map<string | null, { name: string; color: string | null; total_secs: number }>();
+      for (const b of bars) {
+        for (const seg of b.segments) {
+          const id = seg.category_id ?? null;
+          const existing = byId.get(id);
+          if (existing) {
+            existing.total_secs += seg.secs;
+          } else {
+            byId.set(id, {
+              name: seg.category_name ?? (id === null ? "未分类" : "未命名分类"),
+              color: seg.category_color,
+              total_secs: seg.secs,
+            });
+          }
+        }
+      }
+
+      // Sorted by total seconds (largest first), uncategorised always at the very end.
+      const sorted = Array.from(byId.entries())
+        .sort((a, b) => {
+          if (a[0] === null) return 1;
+          if (b[0] === null) return -1;
+          return b[1].total_secs - a[1].total_secs;
+        });
+
+      // Assign fallback colours for categories that the server didn't provide one,
+      // and finalise the legend.
+      let fallbackIdx = 0;
+      const legend = sorted.map(([id, info]) => {
+        let color = info.color;
+        if (!color) {
+          color = id === null ? UNCATEGORIZED_COLOR : FALLBACK_COLORS[fallbackIdx % FALLBACK_COLORS.length];
+          fallbackIdx++;
+        }
+        return { id, name: info.name, color: color!, total_secs: info.total_secs };
+      });
+      setCategoryLegend(legend);
+
       setSelectedBarIdx(null);
       setFilteredData(null);
     } catch (err) {
@@ -259,6 +328,9 @@ export function StatsPage() {
             <CardTitle className="text-sm flex items-center gap-2">
               <Calendar className="h-4 w-4" />
               {BAR_TITLES[range]}
+              <span className="text-[11px] font-normal text-muted-foreground ml-2">
+                （按分类堆叠显示）
+              </span>
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -286,9 +358,38 @@ export function StatsPage() {
                   <div className="flex items-end gap-[2px] h-28 pb-1 min-w-fit">
                   {barData.map((bar, barIdx) => {
                     const maxSecs = Math.max(...barData.map((b) => b.total_secs), 1);
-                    const heightPct = (bar.total_secs / maxSecs) * 100;
+                    const totalHeightPct = (bar.total_secs / maxSecs) * 100;
                     const spread = range === "week" || range === "year";
                     const isSelected = selectedBarIdx === barIdx;
+
+                    // Ensure each segment uses a consistent colour across bars.
+                    // Build a lookup from category_id → legend colour.
+                    const legendColor = new Map<string | null, string>();
+                    for (const l of categoryLegend) legendColor.set(l.id, l.color);
+
+                    // Order segments by the legend order (so segment stacking
+                    // matches the legend order top-to-bottom). Uncategorised
+                    // goes last (= bottom).
+                    const orderedSegs = [...bar.segments].sort((a, b) => {
+                      const ai = categoryLegend.findIndex((l) => l.id === (a.category_id ?? null));
+                      const bi = categoryLegend.findIndex((l) => l.id === (b.category_id ?? null));
+                      if (ai < 0 && bi < 0) return 0;
+                      if (ai < 0) return 1;
+                      if (bi < 0) return -1;
+                      return ai - bi;
+                    });
+
+                    // For the tooltip content
+                    const tooltipLines = orderedSegs
+                      .filter((s) => s.secs > 0)
+                      .map((s) => {
+                        const name =
+                          categoryLegend.find((l) => l.id === (s.category_id ?? null))?.name
+                          ?? s.category_name
+                          ?? "未分类";
+                        return `${name}: ${formatDurationShort(s.secs)}`;
+                      });
+
                     return (
                       <Tooltip key={bar.label}>
                         <TooltipTrigger asChild>
@@ -298,13 +399,48 @@ export function StatsPage() {
                           >
                             <div className="flex-1 w-full flex flex-col justify-end min-h-0">
                               <div
-                                className={`w-full rounded-t transition-colors ${
-                                  isSelected
-                                    ? "bg-primary"
-                                    : "bg-primary/70 hover:bg-primary"
+                                className={`w-full rounded-t overflow-hidden ${
+                                  isSelected ? "ring-2 ring-primary" : ""
                                 }`}
-                                style={{ height: `${Math.max(heightPct, 3)}%`, maxWidth: spread ? "48px" : undefined, marginInline: spread ? "auto" : undefined }}
-                              />
+                                style={{
+                                  height: `${Math.max(totalHeightPct, 3)}%`,
+                                  maxWidth: spread ? "48px" : undefined,
+                                  marginInline: spread ? "auto" : undefined,
+                                }}
+                              >
+                                {/* Stacked segments — fill them from top down using the
+                                    sorted-by-legend order. */}
+                                <div className="w-full h-full flex flex-col justify-end">
+                                  {orderedSegs.map((seg, segIdx) => {
+                                    if (seg.secs <= 0 || bar.total_secs === 0) return null;
+                                    const segPct = (seg.secs / bar.total_secs) * 100;
+                                    if (segPct <= 0) return null;
+                                    const color =
+                                      legendColor.get(seg.category_id ?? null)
+                                      ?? seg.category_color
+                                      ?? UNCATEGORIZED_COLOR;
+                                    // Only add tiny top/right border between segments
+                                    const style: React.CSSProperties = {
+                                      height: `${segPct}%`,
+                                      backgroundColor: color,
+                                    };
+                                    if (segIdx > 0) {
+                                      style.borderTop = "1px solid rgba(255,255,255,0.5)";
+                                    }
+                                    return (
+                                      <div
+                                        key={seg.category_id ?? "__uncat__"}
+                                        style={style}
+                                        title={`${
+                                          categoryLegend.find((l) => l.id === (seg.category_id ?? null))?.name
+                                          ?? seg.category_name
+                                          ?? "未分类"
+                                        }: ${formatDurationShort(seg.secs)}`}
+                                      />
+                                    );
+                                  })}
+                                </div>
+                              </div>
                             </div>
                             <span className={`text-[9px] leading-none mt-0.5 ${isSelected ? "text-primary font-bold" : "text-muted-foreground"}`}>
                               {bar.label}
@@ -312,7 +448,14 @@ export function StatsPage() {
                           </div>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>{bar.label}: {formatDurationShort(bar.total_secs)}</p>
+                          <div className="text-xs space-y-0.5">
+                            <div className="font-bold">{bar.label}: {formatDurationShort(bar.total_secs)}</div>
+                            {tooltipLines.length > 0 ? (
+                              tooltipLines.map((l, i) => <div key={i}>{l}</div>)
+                            ) : (
+                              <div className="text-muted-foreground">无活动</div>
+                            )}
+                          </div>
                         </TooltipContent>
                       </Tooltip>
                     );
@@ -321,6 +464,24 @@ export function StatsPage() {
                 </TooltipProvider>
               </div>
             </div>
+
+            {/* Legend: category → colour */}
+            {categoryLegend.length > 0 && (
+              <div className="mt-4 pt-3 border-t flex flex-wrap gap-3">
+                {categoryLegend.map((l) => (
+                  <div key={l.id ?? "__uncat__"} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span
+                      className="inline-block h-3 w-3 rounded-sm"
+                      style={{ backgroundColor: l.color }}
+                    />
+                    <span className="max-w-[120px] truncate">{l.name}</span>
+                    <span className="text-[10px]">
+                      {formatDurationShort(l.total_secs)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
       )}

@@ -5,11 +5,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { Settings, Monitor, Trash2, Download, Info, ExternalLink, Loader2, FolderOpen, RotateCcw, Power, Image as ImageIcon } from "lucide-react";
+import { Settings, Monitor, Trash2, Download, Info, ExternalLink, Loader2, FolderOpen, RotateCcw, Power, Image as ImageIcon, Cloud, Plus, X, LogIn, LogOut, User } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/Toast";
+import { createApiClient, getActivityEntriesForSync, getScreenshotsForSync, getCategoriesAndAssignmentsForSync } from "@/lib/cloud-api";
 
 export function SettingsPage() {
   const { showToast } = useToast();
@@ -52,6 +53,41 @@ export function SettingsPage() {
   const [selectedMonitors, setSelectedMonitors] = useState<number[]>([]);
   const [layoutMode, setLayoutMode] = useState<string>("horizontal");
 
+  // Cloud sync state
+  const [serverList, setServerList] = useState<Array<{id: string, name: string, url: string, is_official: boolean}>>([]);
+  const [loginSession, setLoginSession] = useState<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string} | null>(null);
+  const [loginDialogOpen, setLoginDialogOpen] = useState(false);
+  const [loginServerUrl, setLoginServerUrl] = useState("");
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [addServerDialogOpen, setAddServerDialogOpen] = useState(false);
+  const [newServerName, setNewServerName] = useState("");
+  const [newServerUrl, setNewServerUrl] = useState("");
+  const [addServerLoading, setAddServerLoading] = useState(false);
+  const [registerDialogOpen, setRegisterDialogOpen] = useState(false);
+  const [registerUsername, setRegisterUsername] = useState("");
+  const [registerPassword, setRegisterPassword] = useState("");
+  const [registerConfirmPassword, setRegisterConfirmPassword] = useState("");
+  const [registerLoading, setRegisterLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncStats, setSyncStats] = useState<{last_sync_time: number | null; inserted: number; duplicate: number}>({
+    last_sync_time: null,
+    inserted: 0,
+    duplicate: 0,
+  });
+  const [deviceList, setDeviceList] = useState<Array<{id: string; device_name: string; platform: string; last_sync_at?: number}>>([]);
+  const [syncConfig, setSyncConfig] = useState<{
+    activity: { scope: "today" | "last_n" | "this_week" | "none"; count: number };
+    screenshot: { scope: "today" | "last_n" | "this_week" | "none"; count: number };
+    categories: boolean;
+  }>({
+    activity: { scope: "today", count: 100 },
+    screenshot: { scope: "last_n", count: 20 },
+    categories: true,
+  });
+  const [syncConfigOpen, setSyncConfigOpen] = useState(false);
+
   // Load screenshot settings on mount
   useEffect(() => {
     Promise.all([
@@ -80,6 +116,30 @@ export function SettingsPage() {
       setScreenshotSettingsLoading(false);
     });
   }, []);
+
+  // Load cloud sync state on mount
+  useEffect(() => {
+    const loadCloudState = async () => {
+      try {
+        const servers = await invoke<Array<{id: string, name: string, url: string, is_official: boolean}>>("get_cloud_server_list");
+        const session = await invoke<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string} | null>("get_login_session");
+        setServerList(servers);
+        setLoginSession(session);
+      } catch (err) {
+        console.error("Failed to load cloud state:", err);
+      }
+    };
+    loadCloudState();
+  }, []);
+
+  // Load device list when logged in
+  useEffect(() => {
+    if (loginSession) {
+      loadDeviceList();
+    } else {
+      setDeviceList([]);
+    }
+  }, [loginSession]);
 
   const handleToggleScreenshot = async () => {
     try {
@@ -244,6 +304,331 @@ export function SettingsPage() {
     } finally {
       setAutostartLoading(false);
     }
+  };
+
+  // Cloud sync handlers
+  const handleAddServer = async () => {
+    if (!newServerName.trim() || !newServerUrl.trim()) {
+      showToast("请填写服务器名称和地址", "error");
+      return;
+    }
+    
+    // Basic URL validation
+    let url = newServerUrl.trim();
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      url = "http://" + url;
+    }
+    
+    setAddServerLoading(true);
+    try {
+      const server = await invoke<{id: string, name: string, url: string, is_official: boolean}>("add_cloud_server", {
+        name: newServerName.trim(),
+        url,
+      });
+      setServerList([...serverList, server]);
+      setAddServerDialogOpen(false);
+      setNewServerName("");
+      setNewServerUrl("");
+      showToast("服务器添加成功", "success");
+    } catch (err) {
+      console.error("Add server failed:", err);
+      showToast("添加失败：" + err, "error");
+    } finally {
+      setAddServerLoading(false);
+    }
+  };
+
+  const handleRemoveServer = async (serverId: string) => {
+    try {
+      await invoke("remove_cloud_server", { serverId });
+      setServerList(serverList.filter(s => s.id !== serverId));
+      if (loginSession?.server_id === serverId) {
+        await handleLogout();
+      }
+      showToast("服务器已删除", "success");
+    } catch (err) {
+      console.error("Remove server failed:", err);
+      showToast("删除失败：" + err, "error");
+    }
+  };
+
+  const handleLogin = async (serverUrl: string) => {
+    if (!loginUsername.trim() || !loginPassword.trim()) {
+      showToast("请填写用户名和密码", "error");
+      return;
+    }
+
+    setLoginLoading(true);
+    try {
+      const api = createApiClient(serverUrl);
+      const result = await api.login(loginUsername.trim(), loginPassword);
+
+      // Register device
+      const deviceResult = await api.registerDevice(result.access_token, "我的电脑", "windows");
+
+      // 从 serverList 中查找匹配 URL 的 id
+      const matched = serverList.find(
+        (s) => s.url.replace(/\/$/, "") === serverUrl.replace(/\/$/, "")
+      );
+      const serverId = matched ? matched.id : serverUrl;
+
+      // Save session locally
+      await invoke("save_session", {
+        serverId,
+        serverUrl,
+        token: result.access_token,
+        userId: result.user_id,
+        displayName: result.display_name,
+        deviceId: deviceResult.device_id,
+      });
+
+      setLoginSession({
+        server_id: serverId,
+        server_url: serverUrl,
+        token: result.access_token,
+        user_id: result.user_id,
+        display_name: result.display_name,
+        device_id: deviceResult.device_id,
+      });
+
+      setLoginDialogOpen(false);
+      setLoginUsername("");
+      setLoginPassword("");
+      showToast("登录成功", "success");
+    } catch (err) {
+      console.error("Login failed:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      showToast("登录失败：" + msg, "error");
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleRegister = async () => {
+    if (!registerUsername.trim() || !registerPassword.trim() || !registerConfirmPassword.trim()) {
+      showToast("请填写所有字段", "error");
+      return;
+    }
+    if (registerPassword !== registerConfirmPassword) {
+      showToast("两次输入的密码不一致", "error");
+      return;
+    }
+    if (registerPassword.length < 6) {
+      showToast("密码至少需要6个字符", "error");
+      return;
+    }
+    
+    setRegisterLoading(true);
+    try {
+      const api = createApiClient(loginServerUrl);
+      await api.register(registerUsername.trim(), registerPassword, registerConfirmPassword);
+      
+      // Auto login after register
+      setLoginPassword(registerPassword);
+      await handleLogin(loginServerUrl);
+      
+      setRegisterDialogOpen(false);
+      setRegisterUsername("");
+      setRegisterPassword("");
+      setRegisterConfirmPassword("");
+    } catch (err) {
+      console.error("Register failed:", err);
+      showToast("注册失败：" + err, "error");
+    } finally {
+      setRegisterLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await invoke("clear_session");
+      setLoginSession(null);
+      setDeviceList([]);
+      setSyncStats({ last_sync_time: null, inserted: 0, duplicate: 0 });
+      showToast("已退出登录", "success");
+    } catch (err) {
+      console.error("Logout failed:", err);
+    }
+  };
+
+  const handleSyncNow = async () => {
+    if (!loginSession) return;
+
+    setSyncing(true);
+    try {
+      const api = createApiClient(loginSession.server_url);
+      let totalInserted = 0;
+      let syncMessages: string[] = [];
+
+      // === Upload activity data ===
+      if (syncConfig.activity.scope !== "none") {
+        const { entries, total } = await getActivityEntriesForSync(
+          syncConfig.activity.scope,
+          syncConfig.activity.count
+        );
+
+        if (entries.length > 0) {
+          const pushResult = await api.pushActivity(
+            loginSession.token,
+            loginSession.device_id,
+            entries
+          );
+          totalInserted += pushResult.inserted;
+          syncMessages.push(`活动记录：上传 ${pushResult.inserted} 条 (共 ${total} 条)`);
+        } else {
+          syncMessages.push("活动记录：无可上传数据");
+        }
+      }
+
+      // === Upload screenshots ===
+      if (syncConfig.screenshot.scope !== "none") {
+        const screenshots = await getScreenshotsForSync(
+          syncConfig.screenshot.scope,
+          syncConfig.screenshot.count
+        );
+
+        if (screenshots.length > 0) {
+          let uploaded = 0;
+          let skipped = 0;
+          let failed = 0;
+          const errorMessages: string[] = [];
+
+          // Upload screenshots one by one (multipart upload requires separate requests)
+          for (const s of screenshots) {
+            try {
+              const result = await api.uploadScreenshot(
+                loginSession.token,
+                loginSession.device_id,
+                s.path,
+                s.timestamp,
+                undefined,
+                undefined
+              );
+              if (result.already_existed) {
+                skipped++;
+              } else {
+                uploaded++;
+              }
+            } catch (err) {
+              failed++;
+              if (errorMessages.length < 3) {
+                const msg = err instanceof Error ? err.message : String(err);
+                errorMessages.push(msg);
+              }
+            }
+          }
+
+          totalInserted += uploaded;
+          const msgParts: string[] = [];
+          if (uploaded > 0) msgParts.push(`新上传 ${uploaded} 张`);
+          if (skipped > 0) msgParts.push(`已存在 ${skipped} 张`);
+          if (failed > 0) msgParts.push(`失败 ${failed} 张`);
+          msgParts.push(`共 ${screenshots.length} 张`);
+          syncMessages.push(`截图：${msgParts.join("，")}`);
+          if (errorMessages.length > 0) {
+            syncMessages.push(`截图错误示例：${errorMessages[0]}`);
+          }
+        } else {
+          syncMessages.push("截图：无可上传数据");
+        }
+      }
+
+      // === Push & pull categories ===
+      if (syncConfig.categories) {
+        try {
+          const catPayload = await getCategoriesAndAssignmentsForSync();
+          if (catPayload.categories.length > 0 || catPayload.assignments.length > 0) {
+            const catResult = await api.pushCategories(
+              loginSession.token,
+              loginSession.device_id,
+              catPayload
+            );
+            const parts: string[] = [];
+            if (catResult.categories_inserted > 0) parts.push(`分类新增 ${catResult.categories_inserted}`);
+            if (catResult.categories_updated > 0) parts.push(`分类更新 ${catResult.categories_updated}`);
+            if (catResult.assignments_inserted > 0) parts.push(`别名新增 ${catResult.assignments_inserted}`);
+            if (catResult.assignments_updated > 0) parts.push(`别名更新 ${catResult.assignments_updated}`);
+            if (parts.length > 0) {
+              syncMessages.push(`分类：${parts.join("，")}`);
+            }
+          }
+
+          // Pull remote categories and overwrite local store
+          const pulledCategories = await api.pullCategories(
+            loginSession.token,
+            loginSession.device_id,
+            syncStats.last_sync_time ?? 0
+          );
+          await invoke("cmd_replace_categories_store", {
+            categories: pulledCategories.categories,
+            assignments: pulledCategories.assignments,
+          });
+          const catCount = pulledCategories.categories.length;
+          const asgnCount = pulledCategories.assignments.length;
+          if (catCount > 0 || asgnCount > 0) {
+            syncMessages.push(`分类拉取：${catCount} 个分类，${asgnCount} 个应用映射`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          syncMessages.push(`分类同步失败：${msg}`);
+        }
+      }
+
+      // === Pull other devices' activity ===
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayStartTs = Math.floor(dayStart.getTime() / 1000);
+      const pullResult = await api.pullActivity(
+        loginSession.token,
+        loginSession.device_id,
+        syncStats.last_sync_time ?? dayStartTs
+      );
+      const pullCount = pullResult.entries?.length ?? 0;
+      if (pullCount > 0) {
+        syncMessages.push(`拉取 ${pullCount} 条来自其他设备的记录`);
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      setSyncStats({
+        last_sync_time: now,
+        inserted: totalInserted,
+        duplicate: 0,
+      });
+
+      setLoginSession({ ...loginSession });
+
+      try {
+        const devices = await api.getDevices(loginSession.token);
+        setDeviceList(devices);
+      } catch {
+        // ignore device list errors
+      }
+
+      showToast(syncMessages.join("；"), "success");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      showToast("同步失败：" + msg, "error");
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const loadDeviceList = async () => {
+    if (!loginSession) return;
+    try {
+      const api = createApiClient(loginSession.server_url);
+      const devices = await api.getDevices(loginSession.token);
+      setDeviceList(devices);
+    } catch {
+      // silently fail
+    }
+  };
+
+  const openLoginDialog = (serverUrl: string = "") => {
+    setLoginServerUrl(serverUrl);
+    setLoginUsername("");
+    setLoginPassword("");
+    setLoginDialogOpen(true);
   };
 
   // Load admin status and data path on mount
@@ -986,6 +1371,180 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
+      {/* 云同步 */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Cloud className="h-5 w-5" />
+            云同步
+          </CardTitle>
+          <CardDescription>登录账号后自动同步使用数据到云端</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Current login status */}
+          {loginSession ? (
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <User className="h-4 w-4 text-muted-foreground" />
+                <div>
+                  <p className="text-sm font-medium">{loginSession.display_name}</p>
+                  <p className="text-xs text-muted-foreground">{loginSession.server_url}</p>
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex items-center gap-1"
+                onClick={handleLogout}
+              >
+                <LogOut className="h-4 w-4" />
+                退出
+              </Button>
+            </div>
+          ) : (
+            <div className="text-center py-4 text-sm text-muted-foreground">
+              未登录云同步账号
+            </div>
+          )}
+
+          {/* Sync status (when logged in) */}
+          {loginSession && (
+            <>
+              <div className="flex items-center justify-between py-1">
+                <div className="flex items-center gap-2 text-sm">
+                  <Loader2 className={`h-4 w-4 ${syncing ? "animate-spin text-primary" : "text-muted-foreground"}`} />
+                  <span className="text-muted-foreground">
+                    {syncStats.last_sync_time
+                      ? `上次同步：${new Date(syncStats.last_sync_time * 1000).toLocaleString()}`
+                      : "尚未同步"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {syncStats.last_sync_time && (
+                    <span className="text-xs text-muted-foreground">
+                      上传 {syncStats.inserted} 条
+                    </span>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-1"
+                    onClick={handleSyncNow}
+                    disabled={syncing}
+                  >
+                    {syncing ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-4 w-4" />
+                    )}
+                    {syncing ? "同步中..." : "立即同步"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setSyncConfigOpen(true)}
+                    title="同步设置"
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+
+              {/* Sync scope summary */}
+              <div className="flex flex-wrap gap-4 text-xs text-muted-foreground px-1">
+                <span>
+                  活动：{syncConfig.activity.scope === "today" ? "今天" : syncConfig.activity.scope === "this_week" ? "本周" : `最近 ${syncConfig.activity.count} 条`}
+                </span>
+                <span>
+                  截图：{syncConfig.screenshot.scope === "today" ? "今天" : syncConfig.screenshot.scope === "this_week" ? "本周" : `最近 ${syncConfig.screenshot.count} 张`}
+                </span>
+                <span>
+                  分类：{syncConfig.categories ? "全量同步" : "不同步"}
+                </span>
+              </div>
+
+              {/* Connected devices */}
+              {deviceList.length > 1 && (
+                <div className="text-xs text-muted-foreground space-y-1">
+                  <p className="text-xs font-medium text-foreground">已连接设备</p>
+                  {deviceList.map((d) => (
+                    <div key={d.id} className="flex items-center gap-2">
+                      <div className={`h-1.5 w-1.5 rounded-full ${d.id === loginSession.device_id ? "bg-green-500" : "bg-blue-500"}`} />
+                      <span>{d.device_name}</span>
+                      <span className="text-[10px]">({d.platform})</span>
+                      {d.last_sync_at && (
+                        <span className="text-[10px]">- {new Date(d.last_sync_at * 1000).toLocaleString()}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <Separator />
+            </>
+          )}
+          
+          {/* Server list */}
+          <div className="space-y-2">
+            <p className="text-sm font-medium">服务器列表</p>
+            {serverList.length === 0 ? (
+              <p className="text-xs text-muted-foreground">暂无服务器，请添加自定义服务器</p>
+            ) : (
+              <div className="space-y-2">
+                {serverList.map((server) => {
+                  const isCurrentServer = loginSession?.server_id === server.id;
+                  return (
+                    <div key={server.id} className="flex items-center justify-between p-2 rounded-md bg-muted/50">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium truncate">{server.name}</p>
+                        <p className="text-xs text-muted-foreground truncate">{server.url}</p>
+                      </div>
+                      <div className="flex items-center gap-1 ml-2">
+                        <Button
+                          variant={isCurrentServer ? "secondary" : "outline"}
+                          size="sm"
+                          onClick={() => isCurrentServer ? {} : openLoginDialog(server.url)}
+                          disabled={isCurrentServer}
+                        >
+                          <LogIn className="h-3 w-3 mr-1" />
+                          {isCurrentServer ? "已登录" : "登录"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleRemoveServer(server.id)}
+                        >
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          
+          <Separator />
+          
+          {/* Add server button */}
+          <div className="flex justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              className="flex items-center gap-1"
+              onClick={() => {
+                setNewServerName("");
+                setNewServerUrl("");
+                setAddServerDialogOpen(true);
+              }}
+            >
+              <Plus className="h-4 w-4" />
+              添加自定义服务器
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* 关于 */}
       <Card>
         <CardHeader>
@@ -997,7 +1556,7 @@ export function SettingsPage() {
         <CardContent className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm font-medium">应用版本</p>
-            <p className="text-sm text-muted-foreground">v0.2.2</p>
+            <p className="text-sm text-muted-foreground">v0.3.0</p>
           </div>
           <Separator />
           <div className="flex items-center justify-between">
@@ -1233,6 +1792,300 @@ export function SettingsPage() {
                       保存中...
                     </>
                   ) : "保存"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Add Server Dialog */}
+      {addServerDialogOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-md mx-4">
+            <CardHeader>
+              <CardTitle>添加自定义服务器</CardTitle>
+              <CardDescription>
+                添加你自己的 SernVia 服务器地址
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">服务器名称</label>
+                <Input
+                  value={newServerName}
+                  onChange={(e) => setNewServerName(e.target.value)}
+                  placeholder="例如：我的服务器"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">服务器地址</label>
+                <Input
+                  value={newServerUrl}
+                  onChange={(e) => setNewServerUrl(e.target.value)}
+                  placeholder="例如：http://192.168.1.100:8080"
+                />
+                <p className="text-xs text-muted-foreground">
+                  请输入服务器的完整地址，包括 http:// 或 https://
+                </p>
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setAddServerDialogOpen(false);
+                    setNewServerName("");
+                    setNewServerUrl("");
+                  }}
+                >
+                  取消
+                </Button>
+                <Button
+                  onClick={handleAddServer}
+                  disabled={addServerLoading}
+                >
+                  {addServerLoading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      添加中...
+                    </>
+                  ) : "添加"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Login Dialog */}
+      {loginDialogOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-md mx-4">
+            <CardHeader>
+              <CardTitle>登录账号</CardTitle>
+              <CardDescription>
+                登录到 {loginServerUrl}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">用户名</label>
+                <Input
+                  value={loginUsername}
+                  onChange={(e) => setLoginUsername(e.target.value)}
+                  placeholder="请输入用户名"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">密码</label>
+                <Input
+                  type="password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="请输入密码"
+                />
+              </div>
+              <div className="flex justify-between pt-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setLoginDialogOpen(false);
+                    setRegisterDialogOpen(true);
+                    setRegisterUsername("");
+                    setRegisterPassword("");
+                    setRegisterConfirmPassword("");
+                  }}
+                >
+                  没有账号？注册
+                </Button>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setLoginDialogOpen(false);
+                      setLoginUsername("");
+                      setLoginPassword("");
+                    }}
+                  >
+                    取消
+                  </Button>
+                  <Button
+                    onClick={() => handleLogin(loginServerUrl)}
+                    disabled={loginLoading}
+                  >
+                    {loginLoading ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                        登录中...
+                      </>
+                    ) : "登录"}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Register Dialog */}
+      {registerDialogOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-md mx-4">
+            <CardHeader>
+              <CardTitle>注册账号</CardTitle>
+              <CardDescription>
+                创建新账号用于 {loginServerUrl}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">用户名</label>
+                <Input
+                  value={registerUsername}
+                  onChange={(e) => setRegisterUsername(e.target.value)}
+                  placeholder="请输入用户名（3-30个字符）"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">密码</label>
+                <Input
+                  type="password"
+                  value={registerPassword}
+                  onChange={(e) => setRegisterPassword(e.target.value)}
+                  placeholder="请输入密码（至少6个字符）"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">确认密码</label>
+                <Input
+                  type="password"
+                  value={registerConfirmPassword}
+                  onChange={(e) => setRegisterConfirmPassword(e.target.value)}
+                  placeholder="请再次输入密码"
+                />
+              </div>
+              <div className="flex justify-between pt-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setRegisterDialogOpen(false);
+                    setLoginDialogOpen(true);
+                  }}
+                >
+                  已有账号？登录
+                </Button>
+                <Button
+                  onClick={handleRegister}
+                  disabled={registerLoading}
+                >
+                  {registerLoading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      注册中...
+                    </>
+                  ) : "注册"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Sync Config Dialog */}
+      {syncConfigOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-md mx-4">
+            <CardHeader>
+              <CardTitle>同步设置</CardTitle>
+              <CardDescription>
+                选择需要同步的数据范围和数量
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Activity sync config */}
+              <div className="space-y-3">
+                <p className="text-sm font-medium">活动记录同步</p>
+                <div className="flex items-center gap-2">
+                  <Select
+                    value={syncConfig.activity.scope}
+                    onValueChange={(v) => setSyncConfig({ ...syncConfig, activity: { ...syncConfig.activity, scope: v as any } })}
+                  >
+                    <SelectTrigger className="flex-1">
+                      <SelectValue placeholder="选择范围" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="today">今天</SelectItem>
+                      <SelectItem value="this_week">本周</SelectItem>
+                      <SelectItem value="last_n">最近 N 条</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {syncConfig.activity.scope === "last_n" && (
+                    <Input
+                      type="number"
+                      className="w-24"
+                      min={10}
+                      max={5000}
+                      value={syncConfig.activity.count}
+                      onChange={(e) => setSyncConfig({ ...syncConfig, activity: { ...syncConfig.activity, count: Number(e.target.value) || 100 } })}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* Screenshot sync config */}
+              <div className="space-y-3">
+                <p className="text-sm font-medium">截图同步</p>
+                <div className="flex items-center gap-2">
+                  <Select
+                    value={syncConfig.screenshot.scope}
+                    onValueChange={(v) => setSyncConfig({ ...syncConfig, screenshot: { ...syncConfig.screenshot, scope: v as any } })}
+                  >
+                    <SelectTrigger className="flex-1">
+                      <SelectValue placeholder="选择范围" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="today">今天</SelectItem>
+                      <SelectItem value="this_week">本周</SelectItem>
+                      <SelectItem value="last_n">最近 N 张</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {syncConfig.screenshot.scope === "last_n" && (
+                    <Input
+                      type="number"
+                      className="w-24"
+                      min={5}
+                      max={1000}
+                      value={syncConfig.screenshot.count}
+                      onChange={(e) => setSyncConfig({ ...syncConfig, screenshot: { ...syncConfig.screenshot, count: Number(e.target.value) || 20 } })}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* Categories sync config */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium">分类与别名同步</p>
+                  <Switch
+                    checked={syncConfig.categories}
+                    onCheckedChange={(v) => setSyncConfig({ ...syncConfig, categories: v })}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {syncConfig.categories
+                    ? "开启后，将全量同步所有分类和别名配置"
+                    : "关闭后，不进行任何分类相关同步"}
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setSyncConfigOpen(false)}
+                >
+                  关闭
                 </Button>
               </div>
             </CardContent>

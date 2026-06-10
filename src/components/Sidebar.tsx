@@ -7,6 +7,7 @@ import {
   Settings,
   ChevronLeft,
   Image as ImageIcon,
+  Tag,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -15,6 +16,7 @@ const navItems = [
   { to: "/stats", icon: BarChart3, label: "统计" },
   { to: "/details", icon: ListTree, label: "详细" },
   { to: "/review", icon: ImageIcon, label: "回顾" },
+  { to: "/categories", icon: Tag, label: "分类" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];
 

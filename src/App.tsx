@@ -7,6 +7,7 @@ import { DetailsPage } from "@/pages/DetailsPage";
 import { AppDetailPage } from "@/pages/AppDetailPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { ReviewPage } from "@/pages/ReviewPage";
+import { CategoriesPage } from "@/pages/CategoriesPage";
 import { ToastProvider } from "@/components/Toast";
 
 function App() {
@@ -20,6 +21,7 @@ function App() {
           <Route path="/details" element={<DetailsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/review" element={<ReviewPage />} />
+          <Route path="/categories" element={<CategoriesPage />} />
         </Route>
       </Routes>
     </ToastProvider>

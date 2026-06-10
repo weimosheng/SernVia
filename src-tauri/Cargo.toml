@@ -1,6 +1,6 @@
 [package]
 name = "sernvia"
-version = "0.2.2"
+version = "0.3.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,6 +26,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-http = "2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 xcap = "0.4"
 base64 = "0.22.1"
@@ -36,3 +37,5 @@ rand = "0.8"
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["chrono", "bundled"] }
 dirs = "5.0"
+uuid = { version = "1.0", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
