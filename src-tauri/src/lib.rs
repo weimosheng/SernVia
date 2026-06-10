@@ -46,23 +46,26 @@ fn export_data(state: tauri::State<AppState>, path: String) -> Result<(), String
 fn get_app_icon(state: tauri::State<AppState>, process_name: String) -> Option<String> {
     // Check cache first
     {
-        let cache = state.icon_cache.lock().unwrap();
-        if let Some(icon) = cache.get(&process_name) {
-            return Some(icon.clone());
+        if let Ok(cache) = state.icon_cache.lock() {
+            if let Some(icon) = cache.get(&process_name) {
+                return Some(icon.clone());
+            }
         }
     }
     // Extract icon (this checks running processes, common paths, and registry)
     if let Some(base64) = windows_api::extract_app_icon(&process_name) {
-        let mut cache = state.icon_cache.lock().unwrap();
-        cache.insert(process_name.clone(), base64.clone());
+        if let Ok(mut cache) = state.icon_cache.lock() {
+            cache.insert(process_name.clone(), base64.clone());
+        }
         return Some(base64);
     }
     // Fallback: check known app paths from Tai imports
     if let Some(exe_path) = monitor::get_app_path(&process_name) {
         let path = std::path::Path::new(&exe_path);
         if let Some(icon) = windows_api::extract_icon_from_path(path) {
-            let mut cache = state.icon_cache.lock().unwrap();
-            cache.insert(process_name, icon.clone());
+            if let Ok(mut cache) = state.icon_cache.lock() {
+                cache.insert(process_name, icon.clone());
+            }
             return Some(icon);
         }
     }
@@ -629,7 +632,10 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show_i, &hide_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
+                    // Fallback: create a simple colored icon
+                    tauri::image::Image::new(&[0u8; 4], 1, 1)
+                }))
                 .menu(&menu)
                 .tooltip("SernVia - 使用统计")
                 .on_menu_event(|app, event| match event.id.as_ref() {

@@ -111,6 +111,7 @@ pub struct CurrentSession {
     pub browser_domain: Option<String>,
     pub start_time: i64,
     pub accumulated: u64,
+    pub last_check_time: i64,  // 上次检查时间，用于检测睡眠
 }
 
 /// Get the number of days in a given month of a given year
@@ -126,6 +127,7 @@ fn get_days_in_month(year: i32, month: u32) -> u32 {
 
 impl ActivityTracker {
     pub fn new() -> Self {
+        let now = Local::now().timestamp();
         let today = Local::now().format("%Y-%m-%d").to_string();
         let tracker = ActivityTracker {
             current: Arc::new(Mutex::new(CurrentSession {
@@ -136,6 +138,7 @@ impl ActivityTracker {
                 browser_domain: None,
                 start_time: 0,
                 accumulated: 0,
+                last_check_time: now,  // 初始化为当前时间
             })),
             data: Arc::new(Mutex::new(ActivityData {
                 date: today.clone(),
@@ -172,38 +175,65 @@ impl ActivityTracker {
 
         // Check if day changed
         {
-            let mut today = self.today.lock().unwrap();
-            if *today != today_str {
-                // Archive previous day's data before resetting
-                let old_data = self.data.lock().unwrap().clone();
-                if old_data.total_active_secs > 0 {
-                    archive_daily_data(&old_data);
+            if let (Ok(mut today), Ok(mut data)) = (self.today.lock(), self.data.lock()) {
+                if *today != today_str {
+                    // Archive previous day's data before resetting
+                    if data.total_active_secs > 0 {
+                        archive_daily_data(&data);
+                    }
+                    // New day, reset
+                    *data = ActivityData {
+                        date: today_str.clone(),
+                        total_active_secs: 0,
+                        apps: Vec::new(),
+                        browsers: Vec::new(),
+                        history: Vec::new(),
+                    };
+                    *today = today_str;
                 }
-                // New day, reset
-                let new_data = ActivityData {
-                    date: today_str.clone(),
-                    total_active_secs: 0,
-                    apps: Vec::new(),
-                    browsers: Vec::new(),
-                    history: Vec::new(),
-                };
-                *self.data.lock().unwrap() = new_data;
-                *today = today_str;
             }
         }
 
-        let mut current = self.current.lock().unwrap();
+        let mut current = match self.current.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Sleep detection: if time jumped more than 5 minutes (300 seconds), treat as sleep/idle
+        // Don't record the sleep time as activity
+        let time_since_last_check = now.saturating_sub(current.last_check_time);
+        const SLEEP_THRESHOLD_SECS: i64 = 300; // 5 minutes
+        
+        if time_since_last_check > SLEEP_THRESHOLD_SECS {
+            // Sleep detected: reset the session without recording sleep time
+            // Just start fresh with the new activity
+            *current = CurrentSession {
+                app_name: app_name.to_string(),
+                process_name: process_name.to_string(),
+                window_title: window_title.to_string(),
+                is_browser,
+                browser_domain,
+                start_time: now,
+                accumulated: 0,
+                last_check_time: now,
+            };
+            return;
+        }
 
         // If same app/window, just update
         if current.app_name == app_name && current.window_title == window_title {
             current.accumulated = now.saturating_sub(current.start_time) as u64;
+            current.last_check_time = now;
             return;
         }
 
-        // Record the previous session
+        // Record the previous session (only if within normal time range)
         if !current.app_name.is_empty() && current.start_time > 0 {
             let duration = now.saturating_sub(current.start_time) as u64;
-            if duration > 0 {
+            // Only record if duration is reasonable (not sleep time)
+            // Even if duration exceeds threshold, cap it at the threshold
+            let capped_duration = duration.min(SLEEP_THRESHOLD_SECS as u64);
+            if capped_duration > 0 {
                 let entry = ActivityEntry {
                     app_name: current.app_name.clone(),
                     process_name: current.process_name.clone(),
@@ -211,38 +241,39 @@ impl ActivityTracker {
                     is_browser: current.is_browser,
                     browser_domain: current.browser_domain.clone(),
                     start_time: current.start_time,
-                    end_time: now,
-                    duration_secs: duration,
+                    end_time: current.start_time + capped_duration as i64,
+                    duration_secs: capped_duration,
                 };
 
-                let mut data = self.data.lock().unwrap();
-                data.total_active_secs += duration;
-                data.history.push(entry.clone());
+                if let Ok(mut data) = self.data.lock() {
+                    data.total_active_secs += capped_duration;
+                    data.history.push(entry.clone());
 
-                // Update app stats (match by process_name for consistency with Tai imports)
-                if let Some(app) = data.apps.iter_mut().find(|a| a.process_name == current.process_name) {
-                    app.total_secs += duration;
-                    app.session_count += 1;
-                } else {
-                    data.apps.push(AppStats {
-                        name: current.app_name.clone(),
-                        process_name: current.process_name.clone(),
-                        total_secs: duration,
-                        session_count: 1,
-                    });
-                }
-
-                // Update browser stats if applicable
-                if let Some(ref domain) = current.browser_domain {
-                    if let Some(b) = data.browsers.iter_mut().find(|b| b.domain == *domain) {
-                        b.total_secs += duration;
-                        b.title = current.window_title.clone();
+                    // Update app stats (match by process_name for consistency with Tai imports)
+                    if let Some(app) = data.apps.iter_mut().find(|a| a.process_name == current.process_name) {
+                        app.total_secs += capped_duration;
+                        app.session_count += 1;
                     } else {
-                        data.browsers.push(BrowserStats {
-                            domain: domain.clone(),
-                            title: current.window_title.clone(),
-                            total_secs: duration,
+                        data.apps.push(AppStats {
+                            name: current.app_name.clone(),
+                            process_name: current.process_name.clone(),
+                            total_secs: capped_duration,
+                            session_count: 1,
                         });
+                    }
+
+                    // Update browser stats if applicable
+                    if let Some(ref domain) = current.browser_domain {
+                        if let Some(b) = data.browsers.iter_mut().find(|b| b.domain == *domain) {
+                            b.total_secs += capped_duration;
+                            b.title = current.window_title.clone();
+                        } else {
+                            data.browsers.push(BrowserStats {
+                                domain: domain.clone(),
+                                title: current.window_title.clone(),
+                                total_secs: capped_duration,
+                            });
+                        }
                     }
                 }
             }
@@ -257,57 +288,76 @@ impl ActivityTracker {
             browser_domain,
             start_time: now,
             accumulated: 0,
+            last_check_time: now,
         };
     }
 
     pub fn get_current_activity(&self) -> CurrentActivity {
-        let current = self.current.lock().unwrap();
+        if let Ok(current) = self.current.lock() {
+            return CurrentActivity {
+                app_name: current.app_name.clone(),
+                window_title: current.window_title.clone(),
+                is_browser: current.is_browser,
+                browser_domain: current.browser_domain.clone(),
+                active_seconds: current.accumulated,
+            };
+        }
         CurrentActivity {
-            app_name: current.app_name.clone(),
-            window_title: current.window_title.clone(),
-            is_browser: current.is_browser,
-            browser_domain: current.browser_domain.clone(),
-            active_seconds: current.accumulated,
+            app_name: String::new(),
+            window_title: String::new(),
+            is_browser: false,
+            browser_domain: None,
+            active_seconds: 0,
         }
     }
 
     pub fn get_stats(&self) -> ActivityData {
-        let data = self.data.lock().unwrap();
-        // Sort by time
-        let mut apps = data.apps.clone();
-        apps.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
+        if let Ok(data) = self.data.lock() {
+            // Sort by time
+            let mut apps = data.apps.clone();
+            apps.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
 
-        let mut browsers = data.browsers.clone();
-        browsers.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
+            let mut browsers = data.browsers.clone();
+            browsers.sort_by(|a, b| b.total_secs.cmp(&a.total_secs));
 
-        let mut history = data.history.clone();
-        history.reverse();
-        history.truncate(100);
+            let mut history = data.history.clone();
+            history.reverse();
+            history.truncate(100);
 
-        ActivityData {
-            date: data.date.clone(),
-            total_active_secs: data.total_active_secs,
-            apps,
-            browsers,
-            history,
+            return ActivityData {
+                date: data.date.clone(),
+                total_active_secs: data.total_active_secs,
+                apps,
+                browsers,
+                history,
+            };
         }
-    }
-
-    pub fn save(&self) {
-        let data = self.data.lock().unwrap();
-        save_activity_data(&data);
-    }
-
-    pub fn clear(&self) {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let mut data = self.data.lock().unwrap();
-        *data = ActivityData {
-            date: today,
+        ActivityData {
+            date: String::new(),
             total_active_secs: 0,
             apps: Vec::new(),
             browsers: Vec::new(),
             history: Vec::new(),
-        };
+        }
+    }
+
+    pub fn save(&self) {
+        if let Ok(data) = self.data.lock() {
+            save_activity_data(&data);
+        }
+    }
+
+    pub fn clear(&self) {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if let Ok(mut data) = self.data.lock() {
+            *data = ActivityData {
+                date: today,
+                total_active_secs: 0,
+                apps: Vec::new(),
+                browsers: Vec::new(),
+                history: Vec::new(),
+            };
+        }
         // Delete today's saved file
         let path = get_data_path();
         let _ = std::fs::remove_file(&path);
@@ -328,6 +378,7 @@ impl ActivityTracker {
         known_paths.push("known_app_paths.json");
         let _ = std::fs::remove_file(&known_paths);
 
+        let now = chrono::Local::now().timestamp();
         let mut current = self.current.lock().unwrap();
         *current = CurrentSession {
             app_name: String::new(),
@@ -337,6 +388,7 @@ impl ActivityTracker {
             browser_domain: None,
             start_time: 0,
             accumulated: 0,
+            last_check_time: now,
         };
     }
 

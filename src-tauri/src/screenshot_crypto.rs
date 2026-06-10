@@ -75,10 +75,11 @@ pub fn set_screenshot_password(password: &str) -> Result<(), String> {
                             let nonce_bytes = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
                             let ciphertext = &data[SALT_LEN + NONCE_LEN..];
                             
-                            let cipher = Aes256Gcm::new_from_slice(&enc_key).unwrap();
-                            let nonce = Nonce::from_slice(nonce_bytes);
-                            if cipher.decrypt(nonce, ciphertext).is_ok() {
-                                continue; // Already encrypted with current key
+                            if let Ok(cipher) = Aes256Gcm::new_from_slice(&enc_key) {
+                                let nonce = Nonce::from_slice(nonce_bytes);
+                                if cipher.decrypt(nonce, ciphertext).is_ok() {
+                                    continue; // Already encrypted with current key
+                                }
                             }
                         }
                         

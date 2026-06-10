@@ -199,6 +199,7 @@ function AppDetailList({ apps }: { apps: AppStats[] }) {
   }
 
   const sorted = [...apps].sort((a, b) => b.total_secs - a.total_secs);
+  const totalSeconds = sorted.reduce((sum, app) => sum + app.total_secs, 0);
 
   return (
     <Card>
@@ -209,30 +210,91 @@ function AppDetailList({ apps }: { apps: AppStats[] }) {
         <ScrollArea className="h-[500px] pr-4">
           <div className="space-y-1">
             {sorted.map((app, idx) => (
-              <div key={app.name}>
-                <div
-                  className="flex items-center justify-between py-3 cursor-pointer rounded-md hover:bg-muted/50 px-2 -mx-2 transition-colors"
-                  onClick={() => navigate(`/details/${encodeURIComponent(app.name)}`)}
-                >
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted text-xs font-bold text-muted-foreground">
-                      {app.name.charAt(0).toUpperCase()}
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium truncate">{app.name}</p>
-                    </div>
-                  </div>
-                  <Badge variant="secondary" className="shrink-0">
-                    {formatDurationShort(app.total_secs)}
-                  </Badge>
-                </div>
-                {idx < sorted.length - 1 && <Separator />}
-              </div>
+              <AppDetailItem key={app.name} app={app} idx={idx} totalCount={sorted.length} totalSeconds={totalSeconds} navigate={navigate} />
             ))}
           </div>
         </ScrollArea>
       </CardContent>
     </Card>
+  );
+}
+
+const APP_COLORS = [
+  "bg-blue-500", "bg-purple-500", "bg-pink-500", "bg-amber-500",
+  "bg-emerald-500", "bg-cyan-500", "bg-orange-500", "bg-indigo-500",
+  "bg-rose-500", "bg-teal-500", "bg-violet-500", "bg-lime-500",
+];
+
+// Shared icon cache for app icons
+const iconCache = new Map<string, string>();
+
+function useAppIcon(appName: string, processName?: string): string | null {
+  const [icon, setIcon] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (iconCache.has(appName)) {
+      setIcon(iconCache.get(appName)!);
+      return;
+    }
+
+    const procName = processName || `${appName.replace(/\s+/g, '').toLowerCase()}.exe`;
+
+    invoke<string | null>("get_app_icon", { processName: procName })
+      .then((base64) => {
+        if (base64) {
+          const dataUrl = `data:image/png;base64,${base64}`;
+          iconCache.set(appName, dataUrl);
+          setIcon(dataUrl);
+        } else {
+          iconCache.set(appName, ""); // Mark as failed to avoid retrying
+          setIcon(null);
+        }
+      })
+      .catch(() => {
+        iconCache.set(appName, "");
+        setIcon(null);
+      });
+  }, [appName, processName]);
+
+  return icon;
+}
+
+function AppDetailItem({ app, idx, totalCount, totalSeconds, navigate }: { app: AppStats; idx: number; totalCount: number; totalSeconds: number; navigate: ReturnType<typeof useNavigate> }) {
+  const icon = useAppIcon(app.name, app.process_name);
+  const color = APP_COLORS[idx % APP_COLORS.length];
+  const percentage = totalSeconds > 0 ? Math.round((app.total_secs / totalSeconds) * 100) : 0;
+
+  return (
+    <div key={app.name}>
+      <div
+        className="flex items-center justify-between py-3 cursor-pointer rounded-md hover:bg-muted/50 px-2 -mx-2 transition-colors"
+        onClick={() => navigate(`/details/${encodeURIComponent(app.name)}`)}
+      >
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          {icon ? (
+            <img src={icon} alt="" className="h-8 w-8 shrink-0 rounded-md" />
+          ) : (
+            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white text-xs font-bold ${color}`}>
+              {app.name.charAt(0).toUpperCase()}
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium truncate">{app.name}</p>
+            {/* Progress bar */}
+            <div className="mt-1 h-1.5 bg-muted rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ${color}`}
+                style={{ width: `${percentage}%` }}
+              />
+            </div>
+          </div>
+        </div>
+        <Badge variant="secondary" className="shrink-0 ml-3">
+          {formatDurationShort(app.total_secs)}
+        </Badge>
+      </div>
+      {idx < totalCount - 1 && <Separator />}
+    </div>
   );
 }
 
@@ -249,6 +311,7 @@ function BrowserDetailList({ browsers }: { browsers: BrowserStats[] }) {
   }
 
   const sorted = [...browsers].sort((a, b) => b.total_secs - a.total_secs);
+  const totalSeconds = sorted.reduce((sum, b) => sum + b.total_secs, 0);
 
   return (
     <Card>
@@ -258,32 +321,39 @@ function BrowserDetailList({ browsers }: { browsers: BrowserStats[] }) {
       <CardContent>
         <ScrollArea className="h-[500px] pr-4">
           <div className="space-y-1">
-            {sorted.map((b, idx) => (
-              <div key={b.domain}>
-                <div className="flex items-center justify-between py-3">
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <img
-                      src={`https://www.google.com/s2/favicons?domain=${b.domain}&sz=32`}
-                      alt=""
-                      className="h-6 w-6 shrink-0 rounded"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).style.display = "none";
-                      }}
-                    />
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium truncate">{b.domain}</p>
-                      <p className="text-xs text-muted-foreground truncate">
-                        {b.title}
-                      </p>
+            {sorted.map((b, idx) => {
+              const percentage = totalSeconds > 0 ? Math.round((b.total_secs / totalSeconds) * 100) : 0;
+              const color = APP_COLORS[idx % APP_COLORS.length];
+              return (
+                <div key={b.domain}>
+                  <div className="flex items-center justify-between py-3">
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
+                      <img
+                        src={`https://www.google.com/s2/favicons?domain=${b.domain}&sz=32`}
+                        alt=""
+                        className="h-6 w-6 shrink-0 rounded"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).style.display = "none";
+                        }}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium truncate">{b.domain}</p>
+                        <div className="mt-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${color}`}
+                            style={{ width: `${percentage}%` }}
+                          />
+                        </div>
+                      </div>
                     </div>
+                    <Badge variant="secondary" className="shrink-0 ml-3">
+                      {formatDurationShort(b.total_secs)}
+                    </Badge>
                   </div>
-                  <Badge variant="secondary" className="shrink-0">
-                    {formatDurationShort(b.total_secs)}
-                  </Badge>
+                  {idx < sorted.length - 1 && <Separator />}
                 </div>
-                {idx < sorted.length - 1 && <Separator />}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </ScrollArea>
       </CardContent>
