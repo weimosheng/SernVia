@@ -166,6 +166,11 @@ fn is_admin() -> bool {
 }
 
 #[tauri::command]
+fn get_computer_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Unknown".to_string())
+}
+
+#[tauri::command]
 fn set_data_path(new_path: String) -> Result<(), String> {
     monitor::set_data_path(&new_path)
 }
@@ -619,6 +624,8 @@ pub struct LoginSession {
     pub user_id: String,
     pub display_name: String,
     pub device_id: String,
+    pub device_unique_id: Option<i64>,
+    pub device_alias: Option<String>,
 }
 
 fn get_cloud_config_dir() -> std::path::PathBuf {
@@ -722,7 +729,7 @@ fn get_login_session() -> Option<LoginSession> {
 }
 
 #[tauri::command]
-fn save_session(server_id: String, server_url: String, token: String, user_id: String, display_name: String, device_id: String) -> Result<(), String> {
+fn save_session(server_id: String, server_url: String, token: String, user_id: String, display_name: String, device_id: String, device_unique_id: Option<i64>, device_alias: Option<String>) -> Result<(), String> {
     let session = LoginSession {
         server_id,
         server_url,
@@ -730,6 +737,8 @@ fn save_session(server_id: String, server_url: String, token: String, user_id: S
         user_id,
         display_name,
         device_id,
+        device_unique_id,
+        device_alias,
     };
     save_login_session(&session)
 }
@@ -835,6 +844,7 @@ async fn cloud_http_register_device(server_url: String, token: String, device_na
     let body = serde_json::json!({
         "device_name": device_name,
         "platform": platform,
+        "unique_id": null,
     });
 
     let response = client
@@ -845,6 +855,40 @@ async fn cloud_http_register_device(server_url: String, token: String, device_na
         .send()
         .await
         .map_err(|e| format!("请求 {} 失败: {}", url, e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            .unwrap_or_else(|| format!("请求 {} 返回 HTTP {}", url, status.as_u16()));
+        return Err(msg);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+}
+
+/// Set a custom alias for a device
+#[tauri::command]
+async fn cloud_http_set_device_alias(server_url: String, token: String, unique_id: i64, alias: String) -> Result<serde_json::Value, String> {
+    let base = server_url.trim_end_matches('/');
+    let url = format!("{}/api/v1/devices/alias", base);
+    let client = make_http_client();
+    let body = serde_json::json!({
+        "unique_id": unique_id,
+        "alias": alias,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("设置设备别名失败: {}", e))?;
 
     let status = response.status();
     let text = response.text().await.map_err(|e| e.to_string())?;
@@ -875,15 +919,18 @@ async fn cloud_http_test(server_url: String) -> Result<bool, String> {
 
 /// Push activity entries to cloud server
 #[tauri::command]
-async fn cloud_http_push_activity(server_url: String, token: String, device_id: String, entries: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn cloud_http_push_activity(server_url: String, token: String, device_id: String, device_unique_id: Option<i64>, entries: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
     let base = server_url.trim_end_matches('/');
     let url = format!("{}/api/v1/activity/push", base);
     let client = make_http_client();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "device_id": device_id,
         "entries": entries,
     });
+    if let Some(uid) = device_unique_id {
+        body["device_unique_id"] = serde_json::json!(uid);
+    }
 
     let response = client
         .post(&url)
@@ -970,6 +1017,7 @@ async fn cloud_http_push_categories(
     server_url: String,
     token: String,
     device_id: String,
+    device_unique_id: Option<i64>,
     categories: Vec<serde_json::Value>,
     assignments: Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
@@ -977,11 +1025,14 @@ async fn cloud_http_push_categories(
     let url = format!("{}/api/v1/categories/push", base);
     let client = make_http_client();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "device_id": device_id,
         "categories": categories,
         "assignments": assignments,
     });
+    if let Some(uid) = device_unique_id {
+        body["device_unique_id"] = serde_json::json!(uid);
+    }
 
     let response = client
         .post(&url)
@@ -1300,6 +1351,7 @@ async fn cloud_http_upload_screenshot(
     server_url: String,
     token: String,
     device_id: String,
+    device_unique_id: Option<i64>,
     screenshot_path: String,
     capture_time: i64,
     app_name: Option<String>,
@@ -1353,6 +1405,9 @@ async fn cloud_http_upload_screenshot(
         .text("file_size", file_size.to_string())
         .part("file", part);
 
+    if let Some(uid) = device_unique_id {
+        form = form.text("device_unique_id", uid.to_string());
+    }
     if let Some(app) = app_name {
         form = form.text("app_name", app);
     }
@@ -1459,7 +1514,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, change_screenshot_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot, get_cloud_server_list, add_cloud_server, remove_cloud_server, get_login_session, save_session, clear_session, cloud_http_login, cloud_http_register, cloud_http_register_device, cloud_http_test, cloud_http_push_activity, cloud_http_pull_activity, cloud_http_get_devices, cloud_http_upload_screenshot, cloud_http_push_categories, cloud_http_pull_categories, get_activity_entries_for_sync, get_screenshots_for_sync, get_category_bar_data, get_apps_with_meta, categories::cmd_get_categories, categories::cmd_add_category, categories::cmd_update_category, categories::cmd_delete_category, categories::cmd_get_assignments, categories::cmd_set_app_category, categories::cmd_set_app_alias, categories::cmd_remove_app_assignment, categories::cmd_replace_categories_store])
+        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_computer_name, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, change_screenshot_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot, get_cloud_server_list, add_cloud_server, remove_cloud_server, get_login_session, save_session, clear_session, cloud_http_login, cloud_http_register, cloud_http_register_device, cloud_http_test, cloud_http_push_activity, cloud_http_pull_activity, cloud_http_get_devices, cloud_http_set_device_alias, cloud_http_upload_screenshot, cloud_http_push_categories, cloud_http_pull_categories, get_activity_entries_for_sync, get_screenshots_for_sync, get_category_bar_data, get_apps_with_meta, categories::cmd_get_categories, categories::cmd_add_category, categories::cmd_update_category, categories::cmd_delete_category, categories::cmd_get_assignments, categories::cmd_set_app_category, categories::cmd_set_app_alias, categories::cmd_remove_app_assignment, categories::cmd_replace_categories_store])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

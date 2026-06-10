@@ -55,7 +55,7 @@ export function SettingsPage() {
 
   // Cloud sync state
   const [serverList, setServerList] = useState<Array<{id: string, name: string, url: string, is_official: boolean}>>([]);
-  const [loginSession, setLoginSession] = useState<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string} | null>(null);
+  const [loginSession, setLoginSession] = useState<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string, device_unique_id: number | null, device_alias: string | null} | null>(null);
   const [loginDialogOpen, setLoginDialogOpen] = useState(false);
   const [loginServerUrl, setLoginServerUrl] = useState("");
   const [loginUsername, setLoginUsername] = useState("");
@@ -76,7 +76,9 @@ export function SettingsPage() {
     inserted: 0,
     duplicate: 0,
   });
-  const [deviceList, setDeviceList] = useState<Array<{id: string; device_name: string; platform: string; last_sync_at?: number}>>([]);
+  const [deviceList, setDeviceList] = useState<Array<{id: string; device_name: string; platform: string; last_sync_at?: number; unique_id?: number; alias?: string | null}>>([]);
+  const [editingDeviceAlias, setEditingDeviceAlias] = useState(false);
+  const [deviceAliasInput, setDeviceAliasInput] = useState("");
   const [syncConfig, setSyncConfig] = useState<{
     activity: { scope: "today" | "last_n" | "this_week" | "none"; count: number };
     screenshot: { scope: "today" | "last_n" | "this_week" | "none"; count: number };
@@ -122,7 +124,7 @@ export function SettingsPage() {
     const loadCloudState = async () => {
       try {
         const servers = await invoke<Array<{id: string, name: string, url: string, is_official: boolean}>>("get_cloud_server_list");
-        const session = await invoke<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string} | null>("get_login_session");
+        const session = await invoke<{server_id: string, server_url: string, token: string, user_id: string, display_name: string, device_id: string, device_unique_id: number | null, device_alias: string | null} | null>("get_login_session");
         setServerList(servers);
         setLoginSession(session);
       } catch (err) {
@@ -364,7 +366,8 @@ export function SettingsPage() {
       const result = await api.login(loginUsername.trim(), loginPassword);
 
       // Register device
-      const deviceResult = await api.registerDevice(result.access_token, "我的电脑", "windows");
+      const computerName = await invoke<string>("get_computer_name");
+      const deviceResult = await api.registerDevice(result.access_token, computerName, "windows");
 
       // 从 serverList 中查找匹配 URL 的 id
       const matched = serverList.find(
@@ -380,6 +383,8 @@ export function SettingsPage() {
         userId: result.user_id,
         displayName: result.display_name,
         deviceId: deviceResult.device_id,
+        deviceUniqueId: deviceResult.unique_id || null,
+        deviceAlias: deviceResult.alias || null,
       });
 
       setLoginSession({
@@ -389,6 +394,8 @@ export function SettingsPage() {
         user_id: result.user_id,
         display_name: result.display_name,
         device_id: deviceResult.device_id,
+        device_unique_id: deviceResult.unique_id || null,
+        device_alias: deviceResult.alias || null,
       });
 
       setLoginDialogOpen(false);
@@ -471,6 +478,7 @@ export function SettingsPage() {
           const pushResult = await api.pushActivity(
             loginSession.token,
             loginSession.device_id,
+            loginSession.device_unique_id,
             entries
           );
           totalInserted += pushResult.inserted;
@@ -499,6 +507,7 @@ export function SettingsPage() {
               const result = await api.uploadScreenshot(
                 loginSession.token,
                 loginSession.device_id,
+                loginSession.device_unique_id,
                 s.path,
                 s.timestamp,
                 undefined,
@@ -541,6 +550,7 @@ export function SettingsPage() {
             const catResult = await api.pushCategories(
               loginSession.token,
               loginSession.device_id,
+              loginSession.device_unique_id,
               catPayload
             );
             const parts: string[] = [];
@@ -1464,19 +1474,95 @@ export function SettingsPage() {
               </div>
 
               {/* Connected devices */}
-              {deviceList.length > 1 && (
+              {deviceList.length > 0 && (
                 <div className="text-xs text-muted-foreground space-y-1">
                   <p className="text-xs font-medium text-foreground">已连接设备</p>
-                  {deviceList.map((d) => (
-                    <div key={d.id} className="flex items-center gap-2">
-                      <div className={`h-1.5 w-1.5 rounded-full ${d.id === loginSession.device_id ? "bg-green-500" : "bg-blue-500"}`} />
-                      <span>{d.device_name}</span>
-                      <span className="text-[10px]">({d.platform})</span>
-                      {d.last_sync_at && (
-                        <span className="text-[10px]">- {new Date(d.last_sync_at * 1000).toLocaleString()}</span>
-                      )}
-                    </div>
-                  ))}
+                  {deviceList.map((d) => {
+                    const isCurrent = d.id === loginSession.device_id;
+                    const displayLabel = d.alias || d.device_name;
+                    return (
+                      <div key={d.id} className="flex items-center gap-2">
+                        <div className={`h-1.5 w-1.5 rounded-full ${isCurrent ? "bg-green-500" : "bg-blue-500"}`} />
+                        <span className="truncate max-w-[180px]">{displayLabel}</span>
+                        {d.alias && <span className="text-[10px] opacity-60">({d.device_name})</span>}
+                        <span className="text-[10px]">({d.platform})</span>
+                        {d.last_sync_at && (
+                          <span className="text-[10px]">- {new Date(d.last_sync_at * 1000).toLocaleString()}</span>
+                        )}
+                        {isCurrent && d.unique_id && (
+                          <span className="text-[10px] bg-muted px-1 rounded">ID: {d.unique_id}</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Current device alias editor */}
+              {loginSession?.device_unique_id && (
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground">本机别名：</span>
+                  {editingDeviceAlias ? (
+                    <>
+                      <Input
+                        value={deviceAliasInput}
+                        onChange={(e) => setDeviceAliasInput(e.target.value)}
+                        placeholder={loginSession.device_alias || "输入别名"}
+                        className="h-7 w-32 text-xs"
+                        autoFocus
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const api = createApiClient(loginSession.server_url);
+                            api.setDeviceAlias(loginSession.token, loginSession.device_unique_id!, deviceAliasInput)
+                              .then(() => {
+                                setLoginSession({ ...loginSession, device_alias: deviceAliasInput || null });
+                                setEditingDeviceAlias(false);
+                                loadDeviceList();
+                              })
+                              .catch(console.error);
+                          }
+                          if (e.key === "Escape") {
+                            setEditingDeviceAlias(false);
+                            setDeviceAliasInput("");
+                          }
+                        }}
+                      />
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => {
+                          const api = createApiClient(loginSession.server_url);
+                          api.setDeviceAlias(loginSession.token, loginSession.device_unique_id!, deviceAliasInput)
+                            .then(() => {
+                              setLoginSession({ ...loginSession, device_alias: deviceAliasInput || null });
+                              setEditingDeviceAlias(false);
+                              loadDeviceList();
+                            })
+                            .catch(console.error);
+                        }}
+                      >
+                        保存
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-medium">
+                        {loginSession.device_alias || "未设置"}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 px-1 text-xs"
+                        onClick={() => {
+                          setDeviceAliasInput(loginSession.device_alias || "");
+                          setEditingDeviceAlias(true);
+                        }}
+                      >
+                        编辑
+                      </Button>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -1556,7 +1642,7 @@ export function SettingsPage() {
         <CardContent className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm font-medium">应用版本</p>
-            <p className="text-sm text-muted-foreground">v0.3.0</p>
+            <p className="text-sm text-muted-foreground">v0.3.1</p>
           </div>
           <Separator />
           <div className="flex items-center justify-between">

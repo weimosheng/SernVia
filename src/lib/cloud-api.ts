@@ -27,6 +27,8 @@ export interface DeviceInfo {
   device_name: string;
   platform: string;
   last_sync_at?: number;
+  unique_id?: number;
+  alias?: string | null;
 }
 
 export interface SyncEntry {
@@ -260,25 +262,49 @@ function createApiClient(baseUrl: string) {
       token: string,
       deviceName: string,
       platform: string
-    ): Promise<{ device_id: string }> {
+    ): Promise<{ device_id: string; unique_id: number; alias: string | null }> {
       const raw = await invoke<Record<string, unknown>>("cloud_http_register_device", {
         serverUrl: trimmed,
         token,
         deviceName,
         platform,
       });
-      return { device_id: String(raw.device_id ?? "") };
+      return {
+        device_id: String(raw.device_id ?? ""),
+        unique_id: Number(raw.unique_id ?? 0),
+        alias: raw.alias ? String(raw.alias) : null,
+      };
+    },
+
+    async setDeviceAlias(
+      token: string,
+      uniqueId: number,
+      alias: string
+    ): Promise<{ device_id: string; unique_id: number; alias: string }> {
+      const raw = await invoke<Record<string, unknown>>("cloud_http_set_device_alias", {
+        serverUrl: trimmed,
+        token,
+        uniqueId,
+        alias,
+      });
+      return {
+        device_id: String(raw.device_id ?? ""),
+        unique_id: Number(raw.unique_id ?? 0),
+        alias: String(raw.alias ?? ""),
+      };
     },
 
     async pushActivity(
       token: string,
       deviceId: string,
+      deviceUniqueId: number | null,
       entries: SyncEntry[]
     ): Promise<SyncResult> {
       const raw = await invoke<Record<string, unknown>>("cloud_http_push_activity", {
         serverUrl: trimmed,
         token,
         deviceId,
+        deviceUniqueId,
         entries,
       });
       return {
@@ -291,6 +317,7 @@ function createApiClient(baseUrl: string) {
     async uploadScreenshot(
       token: string,
       deviceId: string,
+      deviceUniqueId: number | null,
       screenshotPath: string,
       captureTime: number,
       appName?: string,
@@ -300,6 +327,7 @@ function createApiClient(baseUrl: string) {
         serverUrl: trimmed,
         token,
         deviceId,
+        deviceUniqueId,
         screenshotPath,
         captureTime,
         appName: appName ?? null,
@@ -315,12 +343,14 @@ function createApiClient(baseUrl: string) {
     async pushCategories(
       token: string,
       deviceId: string,
+      deviceUniqueId: number | null,
       payload: CategoriesSyncPayload
     ): Promise<CategoriesSyncResult> {
       const raw = await invoke<Record<string, unknown>>("cloud_http_push_categories", {
         serverUrl: trimmed,
         token,
         deviceId,
+        deviceUniqueId,
         categories: payload.categories,
         assignments: payload.assignments,
       });
@@ -388,6 +418,8 @@ function createApiClient(baseUrl: string) {
         device_name: String(d.device_name ?? ""),
         platform: String(d.platform ?? ""),
         last_sync_at: d.last_sync_at ? Number(d.last_sync_at) : undefined,
+        unique_id: d.unique_id != null ? Number(d.unique_id) : undefined,
+        alias: d.alias ? String(d.alias) : null,
       }));
     },
 
