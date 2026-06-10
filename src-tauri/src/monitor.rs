@@ -113,6 +113,17 @@ pub struct CurrentSession {
     pub accumulated: u64,
 }
 
+/// Get the number of days in a given month of a given year
+fn get_days_in_month(year: i32, month: u32) -> u32 {
+    if month == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .map(|d| d.pred_opt().unwrap().day())
+    .unwrap_or(31)
+}
+
 impl ActivityTracker {
     pub fn new() -> Self {
         let today = Local::now().format("%Y-%m-%d").to_string();
@@ -427,20 +438,38 @@ impl ActivityTracker {
     /// Aggregate stats for N days with an offset from today.
     /// offset_days=0 → current period (today), offset_days=1 → yesterday, etc.
     /// Special handling: if days=7, use calendar week (Monday-Sunday)
-    pub fn get_stats_by_range_offset(&self, days: u32, offset_days: u32) -> WeekData {
+    pub fn get_stats_by_range_offset(&self, days: u32, offset_days: u32, range: &str) -> WeekData {
         let today = chrono::Local::now().date_naive();
-        let end_date = today - chrono::Duration::days(offset_days as i64);
+        let ref_date = today - chrono::Duration::days(offset_days as i64);
         
-        let (start_date, end_date) = if days == 7 {
-            // For week view, use calendar week (Monday-Sunday)
-            let weekday = end_date.weekday().num_days_from_monday();
-            let monday = end_date - chrono::Duration::days(weekday as i64);
-            let sunday = monday + chrono::Duration::days(6);
-            (monday, sunday)
-        } else {
-            // For other ranges, just use fixed days
-            let start_date = end_date - chrono::Duration::days((days - 1) as i64);
-            (start_date, end_date)
+        let (start_date, end_date) = match range {
+            "month" => {
+                // Calendar month: 1st to last day of the reference month
+                let year = ref_date.year();
+                let month = ref_date.month();
+                let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+                let last = chrono::NaiveDate::from_ymd_opt(year, month, get_days_in_month(year, month)).unwrap();
+                (first, last)
+            }
+            "year" => {
+                // Calendar year: Jan 1 to Dec 31 of the reference year
+                let year = ref_date.year();
+                let first = chrono::NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+                let last = chrono::NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
+                (first, last)
+            }
+            _ => {
+                if days == 7 {
+                    // Calendar week (Monday-Sunday)
+                    let weekday = ref_date.weekday().num_days_from_monday();
+                    let monday = ref_date - chrono::Duration::days(weekday as i64);
+                    let sunday = monday + chrono::Duration::days(6);
+                    (monday, sunday)
+                } else {
+                    // Day: just the reference date
+                    (ref_date, ref_date)
+                }
+            }
         };
 
         let mut all_apps: HashMap<String, AppStats> = HashMap::new();
@@ -543,16 +572,16 @@ impl ActivityTracker {
     }
 
     fn get_daily_bar_data_offset(&self, days: u32, offset_days: u32) -> Vec<BarEntry> {
-        let data = self.get_stats_by_range_offset(days, offset_days);
-        let mut data_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for d in &data.days {
-            data_map.insert(d.date.clone(), d.total_secs);
-        }
-        // Reuse logic similar to get_daily_bar_data but with offset reference
         let today = chrono::Local::now();
-        let ref_date = today - chrono::Duration::days(offset_days as i64);
+        let ref_date = today.date_naive() - chrono::Duration::days(offset_days as i64);
 
         if days <= 7 {
+            // Week view: show Mon-Sun of the reference week
+            let week_data = self.get_stats_by_range_offset(7, offset_days, "week");
+            let mut data_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for d in &week_data.days {
+                data_map.insert(d.date.clone(), d.total_secs);
+            }
             let weekday = ref_date.weekday().num_days_from_monday();
             let monday = ref_date - chrono::Duration::days(weekday as i64);
             let weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
@@ -565,31 +594,37 @@ impl ActivityTracker {
                 }
             }).collect()
         } else {
+            // Month view: load each day of the reference calendar month individually
             let year = ref_date.year();
             let month = ref_date.month();
-            let mut result = Vec::with_capacity(31);
-            for day in 1..=31 {
-                if let Some(_date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
-                    let date_str = format!("{:04}-{:02}-{:02}", year, month, day);
-                    let secs = data_map.get(&date_str).copied().unwrap_or(0);
-                    result.push(BarEntry {
-                        label: format!("{}", day),
-                        total_secs: secs,
-                    });
-                }
+            let days_in_month = get_days_in_month(year, month);
+            let mut result = Vec::with_capacity(days_in_month as usize);
+            for day in 1..=days_in_month {
+                let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+                let day_data = self.load_daily_data(&date);
+                let secs = day_data.map(|d| d.total_active_secs).unwrap_or(0);
+                result.push(BarEntry {
+                    label: format!("{}", day),
+                    total_secs: secs,
+                });
             }
             result
         }
     }
 
     fn get_monthly_bar_data_offset(&self, offset_days: u32) -> Vec<BarEntry> {
-        let year_data = self.get_stats_by_range_offset(365, offset_days);
+        // Load the calendar year containing the reference date, bucket by month
+        let today = chrono::Local::now();
+        let ref_date = today.date_naive() - chrono::Duration::days(offset_days as i64);
+        let year = ref_date.year();
         let mut months = vec![0u64; 12];
-        for d in &year_data.days {
-            if let Ok(date) = chrono::NaiveDate::parse_from_str(&d.date, "%Y-%m-%d") {
-                let month_idx = (date.month() - 1) as usize;
-                if month_idx < 12 {
-                    months[month_idx] += d.total_secs;
+        for month in 1..=12 {
+            let days_in_month = get_days_in_month(year, month);
+            for day in 1..=days_in_month {
+                let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+                if let Some(day_data) = self.load_daily_data(&date) {
+                    let idx = (month - 1) as usize;
+                    months[idx] += day_data.total_active_secs;
                 }
             }
         }
@@ -638,19 +673,17 @@ impl ActivityTracker {
     }
 
     fn get_daily_bar_data(&self, days: u32) -> Vec<BarEntry> {
-        let week_data = self.get_stats_by_range(days);
-        // Build a lookup map: date -> total_secs
-        let mut data_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for d in &week_data.days {
-            data_map.insert(d.date.clone(), d.total_secs);
-        }
-
         let today = chrono::Local::now();
 
         if days <= 7 {
             // Week view: always show Mon-Sun of the current week (7 entries)
-            let weekday = today.weekday().num_days_from_monday(); // 0=Mon, 6=Sun
-            let monday = today - chrono::Duration::days(weekday as i64);
+            let week_data = self.get_stats_by_range(7);
+            let mut data_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for d in &week_data.days {
+                data_map.insert(d.date.clone(), d.total_secs);
+            }
+            let weekday = today.weekday().num_days_from_monday();
+            let monday = today.date_naive() - chrono::Duration::days(weekday as i64);
             let weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
             (0..7).map(|i| {
                 let date = (monday + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
@@ -661,19 +694,19 @@ impl ActivityTracker {
                 }
             }).collect()
         } else {
-            // Month view: show all days of the current month
+            // Month view: load each day of the current calendar month individually
             let year = today.year();
             let month = today.month();
-            let mut result = Vec::with_capacity(31);
-            for day in 1..=31 {
-                if let Some(_date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
-                    let date_str = format!("{:04}-{:02}-{:02}", year, month, day);
-                    let secs = data_map.get(&date_str).copied().unwrap_or(0);
-                    result.push(BarEntry {
-                        label: format!("{}", day),
-                        total_secs: secs,
-                    });
-                }
+            let days_in_month = get_days_in_month(year, month);
+            let mut result = Vec::with_capacity(days_in_month as usize);
+            for day in 1..=days_in_month {
+                let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+                let day_data = self.load_daily_data(&date);
+                let secs = day_data.map(|d| d.total_active_secs).unwrap_or(0);
+                result.push(BarEntry {
+                    label: format!("{}", day),
+                    total_secs: secs,
+                });
             }
             result
         }
@@ -812,10 +845,10 @@ impl ActivityTracker {
     }
 
     pub fn get_app_time_stats(&self, app_name: &str, offset_days: u32) -> AppTimeStats {
-        let day_data = self.get_stats_by_range_offset(1, offset_days);
-        let week_data = self.get_stats_by_range_offset(7, offset_days);
-        let month_data = self.get_stats_by_range_offset(30, offset_days);
-        let year_data = self.get_stats_by_range_offset(365, offset_days);
+        let day_data = self.get_stats_by_range_offset(1, offset_days, "day");
+        let week_data = self.get_stats_by_range_offset(7, offset_days, "week");
+        let month_data = self.get_stats_by_range_offset(30, offset_days, "month");
+        let year_data = self.get_stats_by_range_offset(365, offset_days, "year");
 
         let find_app = |data: &WeekData| -> AppStats {
             data.apps.iter()
@@ -999,18 +1032,20 @@ impl ActivityTracker {
     }
 
     fn get_monthly_bar_data(&self) -> Vec<BarEntry> {
-        let year_data = self.get_stats_by_range(365);
+        // Load current calendar year (Jan 1 - Dec 31), bucket by month
+        let today = chrono::Local::now();
+        let year = today.year();
         let mut months = vec![0u64; 12];
-
-        for d in &year_data.days {
-            if let Ok(date) = chrono::NaiveDate::parse_from_str(&d.date, "%Y-%m-%d") {
-                let month_idx = (date.month() - 1) as usize;
-                if month_idx < 12 {
-                    months[month_idx] += d.total_secs;
+        for month in 1..=12 {
+            let days_in_month = get_days_in_month(year, month);
+            for day in 1..=days_in_month {
+                let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+                if let Some(day_data) = self.load_daily_data(&date) {
+                    let idx = (month - 1) as usize;
+                    months[idx] += day_data.total_active_secs;
                 }
             }
         }
-
         let month_names = ["1月", "2月", "3月", "4月", "5月", "6月",
                           "7月", "8月", "9月", "10月", "11月", "12月"];
         months.iter().enumerate().map(|(i, &secs)| BarEntry {

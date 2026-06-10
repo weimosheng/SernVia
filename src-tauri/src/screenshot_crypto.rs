@@ -126,6 +126,36 @@ pub fn has_password() -> bool {
     settings.password_set
 }
 
+/// Change the screenshot password: verify old password (if set), then update verifier
+pub fn change_password(old_password: &str, new_password: &str) -> Result<(), String> {
+    // If password not set yet, skip verification (first-time setup)
+    if has_password() && !verify_password(old_password)? {
+        return Err("旧密码错误".to_string());
+    }
+    
+    let mut settings = crate::screenshot::load_settings();
+    
+    // Generate new salt and hash for the new password
+    let mut verifier_salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut verifier_salt);
+    
+    let mut verifier_hash = [0u8; KEY_LEN];
+    pbkdf2_hmac::<Sha256>(
+        new_password.as_bytes(),
+        &verifier_salt,
+        PBKDF2_ITERATIONS,
+        &mut verifier_hash,
+    );
+    
+    settings.password_set = true;
+    settings.password_verifier_salt = Some(verifier_salt.to_vec());
+    settings.password_verifier_hash = Some(verifier_hash.to_vec());
+    
+    crate::screenshot::save_settings(&settings);
+    
+    Ok(())
+}
+
 /// Remove password protection
 #[allow(dead_code)]
 pub fn remove_password(password: &str) -> Result<(), String> {

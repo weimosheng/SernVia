@@ -77,7 +77,7 @@ export function StatsPage() {
   const fetchData = useCallback(async () => {
     try {
       const [data, bars] = await Promise.all([
-        invoke<WeekData>("get_stats_by_range_offset", { days: RANGE_DAYS[range], offsetDays }),
+        invoke<WeekData>("get_stats_by_range_offset", { days: RANGE_DAYS[range], offsetDays, range }),
         invoke<BarEntry[]>("get_bar_data_offset", { range, offsetDays }),
       ]);
       setStats(data);

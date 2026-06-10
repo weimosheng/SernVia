@@ -100,8 +100,8 @@ fn get_app_time_stats(state: tauri::State<AppState>, app_name: String, offset_da
 }
 
 #[tauri::command]
-fn get_stats_by_range_offset(state: tauri::State<AppState>, days: u32, offset_days: u32) -> monitor::WeekData {
-    state.tracker.get_stats_by_range_offset(days, offset_days)
+fn get_stats_by_range_offset(state: tauri::State<AppState>, days: u32, offset_days: u32, range: String) -> monitor::WeekData {
+    state.tracker.get_stats_by_range_offset(days, offset_days, &range)
 }
 
 #[tauri::command]
@@ -228,6 +228,11 @@ fn get_max_storage_mb() -> u64 {
 #[tauri::command]
 fn set_max_storage_mb(mb: u64) {
     screenshot::set_max_storage_mb(mb)
+}
+
+#[tauri::command]
+fn change_screenshot_password(old_password: String, new_password: String) -> Result<(), String> {
+    screenshot_crypto::change_password(&old_password, &new_password)
 }
 
 #[tauri::command]
@@ -664,7 +669,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot])
+        .invoke_handler(tauri::generate_handler![get_current_activity, get_stats, get_stats_for_date, get_stats_for_hour, get_weekly_stats, get_stats_by_range, get_stats_by_range_offset, get_bar_data, get_bar_data_offset, get_app_time_stats, get_app_hourly_stats, get_app_daily_stats, get_app_path, get_app_name, export_data, clear_data, get_data_path, get_default_data_path, set_data_path, get_app_icon, import_from_tai, get_tai_db_tables, is_admin, get_screenshot_enabled, get_screenshot_interval, get_screenshots_folder, get_screenshots, set_screenshot_enabled, set_screenshot_interval, set_screenshots_folder, reset_screenshots_folder, get_screenshot_base64, screenshot_has_password, screenshot_set_password, screenshot_verify_password, change_screenshot_password, export_screenshot, delete_screenshot, delete_screenshots, copy_screenshot_to_clipboard, clear_all_screenshots, get_monitor_list, set_selected_monitors, get_selected_monitors, set_layout_mode, get_layout_mode, get_max_storage_mb, set_max_storage_mb, get_storage_usage_mb, get_activity_at_timestamp, get_collections, create_collection, delete_collection, rename_collection, add_screenshot_to_collection, remove_screenshot_from_collection, get_screenshots_in_collection, auto_categorize_screenshot])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

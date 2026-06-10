@@ -101,8 +101,34 @@ const ScreenshotItem = memo(function ScreenshotItem({
   onDelete: () => void;
   onRetry: () => void;
 }) {
+  // Track item width to hide buttons when too small
+  const [largeEnough, setLargeEnough] = useState(true);
+  const itemRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = itemRef.current;
+    if (!el) return;
+
+    const check = () => {
+      const w = el.offsetWidth;
+      setLargeEnough(w >= 150);
+    };
+
+    // Check after layout settles
+    const timer = setTimeout(check, 150);
+
+    const ro = new ResizeObserver(() => check());
+    ro.observe(el);
+
+    return () => {
+      clearTimeout(timer);
+      ro.disconnect();
+    };
+  }, []);
+
   return (
     <div
+      ref={itemRef}
       className={`group relative aspect-video bg-muted rounded-lg overflow-hidden cursor-pointer transition-all min-w-0 max-w-full ${
         isSelected ? "ring-2 ring-primary ring-offset-2" : "hover:ring-2 hover:ring-primary"
       }`}
@@ -138,45 +164,49 @@ const ScreenshotItem = memo(function ScreenshotItem({
       )}
       <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors" />
 
-      <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-        <button
-          onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
-          className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
-        >
-          {isSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-        </button>
-      </div>
+      {largeEnough && (
+        <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
+          >
+            {isSelected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+          </button>
+        </div>
+      )}
 
-      <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 z-10">
-        <button
-          onClick={(e) => { e.stopPropagation(); onCategorize(); }}
-          className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
-          title="自动归类"
-        >
-          <Sparkles className="h-4 w-4" />
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onCopy(); }}
-          className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
-          title="复制"
-        >
-          <Copy className="h-4 w-4" />
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onExport(); }}
-          className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
-          title="导出"
-        >
-          <Download className="h-4 w-4" />
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          className="p-1.5 bg-black/60 hover:bg-red-600 rounded-full transition-colors text-white"
-          title="删除"
-        >
-          <Trash2 className="h-4 w-4" />
-        </button>
-      </div>
+      {largeEnough && (
+        <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 z-10">
+          <button
+            onClick={(e) => { e.stopPropagation(); onCategorize(); }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
+            title="自动归类"
+          >
+            <Sparkles className="h-4 w-4" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onCopy(); }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
+            title="复制"
+          >
+            <Copy className="h-4 w-4" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onExport(); }}
+            className="p-1.5 bg-black/60 hover:bg-black/80 rounded-full transition-colors text-white"
+            title="导出"
+          >
+            <Download className="h-4 w-4" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            className="p-1.5 bg-black/60 hover:bg-red-600 rounded-full transition-colors text-white"
+            title="删除"
+          >
+            <Trash2 className="h-4 w-4" />
+          </button>
+        </div>
+      )}
 
       <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/70 to-transparent opacity-0 group-hover:opacity-100 transition-colors min-h-[44px] flex flex-col justify-end z-10">
         <p className="text-xs text-white whitespace-nowrap overflow-hidden text-ellipsis">{ss.date}</p>

@@ -39,6 +39,14 @@ export function SettingsPage() {
   const [savingMaxStorage, setSavingMaxStorage] = useState<boolean>(false);
   const [maxStorageLoaded, setMaxStorageLoaded] = useState<boolean>(false);
   
+  // Password change state
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [changingPassword, setChangingPassword] = useState(false);
+  const [hasScreenshotPassword, setHasScreenshotPassword] = useState(false);
+  
   // Monitor selection
   const [monitors, setMonitors] = useState<Array<{id: number, x: number, y: number, width: number, height: number, is_primary: boolean}>>([]);
   const [selectedMonitors, setSelectedMonitors] = useState<number[]>([]);
@@ -55,7 +63,8 @@ export function SettingsPage() {
       invoke<string>("get_layout_mode").catch(() => "horizontal"),
       invoke<number>("get_max_storage_mb").catch(() => 0),
       invoke<number>("get_storage_usage_mb").catch(() => 0),
-    ]).then(([enabled, interval, path, monitorList, selected, mode, maxMb, usageMb]) => {
+      invoke<boolean>("screenshot_has_password").catch(() => false),
+    ]).then(([enabled, interval, path, monitorList, selected, mode, maxMb, usageMb, hasPw]) => {
       setScreenshotEnabled(enabled);
       setScreenshotInterval(interval.toString());
       setScreenshotPath(path);
@@ -66,6 +75,7 @@ export function SettingsPage() {
       setStorageUsageLimit(maxMb);
       setStorageUsage(usageMb);
       setMaxStorageLoaded(true);
+      setHasScreenshotPassword(hasPw);
     }).finally(() => {
       setScreenshotSettingsLoading(false);
     });
@@ -165,6 +175,39 @@ export function SettingsPage() {
       } catch (err) {
         console.error("Screenshot path change failed:", err);
       }
+    }
+  };
+
+  const handleChangePassword = async () => {
+    if (!newPassword || !confirmPassword) {
+      showToast("请填写完整密码信息", "error");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      showToast("两次输入的密码不一致", "error");
+      return;
+    }
+    if (newPassword.length < 4) {
+      showToast("密码至少需要4个字符", "error");
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      await invoke("change_screenshot_password", {
+        oldPassword: hasScreenshotPassword ? oldPassword : "",
+        newPassword,
+      });
+      showToast("密码已更新", "success");
+      setPasswordDialogOpen(false);
+      setOldPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setHasScreenshotPassword(true);
+    } catch (err) {
+      console.error("Change password failed:", err);
+      showToast("密码更新失败：" + err, "error");
+    } finally {
+      setChangingPassword(false);
     }
   };
 
@@ -766,48 +809,66 @@ export function SettingsPage() {
                   单位：MB（兆字节）。例如 500 = 500MB，1024 = 1GB。
                 </p>
               </div>
+              
+              <Separator />
+              
+              {/* 密码设置 */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium">截图密码</p>
+                    <p className="text-xs text-muted-foreground">
+                      {hasScreenshotPassword ? "更改截图查看密码" : "设置截图查看密码"}
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setOldPassword("");
+                      setNewPassword("");
+                      setConfirmPassword("");
+                      setPasswordDialogOpen(true);
+                    }}
+                  >
+                    {hasScreenshotPassword ? "更改密码" : "设置密码"}
+                  </Button>
+                </div>
+              </div>
+              
+              <Separator />
+              
+              {/* 清除截图 */}
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium text-destructive">清除所有截图</p>
+                  <p className="text-xs text-muted-foreground">
+                    删除所有截图文件并重置密码设置（不可恢复）
+                  </p>
+                </div>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  className="flex items-center gap-1"
+                  onClick={async () => {
+                    try {
+                      await invoke("clear_all_screenshots");
+                      showToast("截图和密码已清除", "success");
+                      setHasScreenshotPassword(false);
+                      // 刷新页面
+                      window.location.reload();
+                    } catch (err) {
+                      console.error("Clear screenshots failed:", err);
+                      showToast("清除失败：" + err, "error");
+                    }
+                  }}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  清除截图
+                </Button>
+              </div>
             </>
           )}
-        </CardContent>
-      </Card>
-
-      {/* 截图管理 */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base flex items-center gap-2">
-            <ImageIcon className="h-5 w-5" />
-            截图管理
-          </CardTitle>
-          <CardDescription>清除截图和重置密码</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-destructive">清除所有截图</p>
-              <p className="text-xs text-muted-foreground">
-                删除所有截图文件并重置密码设置（不可恢复）
-              </p>
-            </div>
-            <Button
-              variant="destructive"
-              size="sm"
-              className="flex items-center gap-1"
-              onClick={async () => {
-                try {
-                  await invoke("clear_all_screenshots");
-                  showToast("截图和密码已清除", "success");
-                  // 刷新页面
-                  window.location.reload();
-                } catch (err) {
-                  console.error("Clear screenshots failed:", err);
-                  showToast("清除失败：" + err, "error");
-                }
-              }}
-            >
-              <Trash2 className="h-4 w-4 mr-2" />
-              清除截图
-            </Button>
-          </div>
         </CardContent>
       </Card>
 
@@ -936,7 +997,7 @@ export function SettingsPage() {
         <CardContent className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm font-medium">应用版本</p>
-            <p className="text-sm text-muted-foreground">v0.2.1</p>
+            <p className="text-sm text-muted-foreground">v0.2.2</p>
           </div>
           <Separator />
           <div className="flex items-center justify-between">
@@ -1102,6 +1163,77 @@ export function SettingsPage() {
                     )}
                   </Button>
                 )}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Password Change Dialog */}
+      {passwordDialogOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-full max-w-md mx-4">
+            <CardHeader>
+              <CardTitle>{hasScreenshotPassword ? "更改密码" : "设置密码"}</CardTitle>
+              <CardDescription>
+                {hasScreenshotPassword
+                  ? "请输入旧密码验证身份，然后设置新密码"
+                  : "设置密码后，查看截图时需要输入密码"}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {hasScreenshotPassword && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">旧密码</label>
+                  <Input
+                    type="password"
+                    value={oldPassword}
+                    onChange={(e) => setOldPassword(e.target.value)}
+                    placeholder="请输入旧密码"
+                  />
+                </div>
+              )}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">新密码</label>
+                <Input
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="请输入新密码（至少4个字符）"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">确认新密码</label>
+                <Input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="请再次输入新密码"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setPasswordDialogOpen(false);
+                    setOldPassword("");
+                    setNewPassword("");
+                    setConfirmPassword("");
+                  }}
+                >
+                  取消
+                </Button>
+                <Button
+                  onClick={handleChangePassword}
+                  disabled={changingPassword}
+                >
+                  {changingPassword ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      保存中...
+                    </>
+                  ) : "保存"}
+                </Button>
               </div>
             </CardContent>
           </Card>
