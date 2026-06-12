@@ -402,14 +402,7 @@ impl ActivityTracker {
         let date_str = date.format("%Y-%m-%d").to_string();
 
         if *date == today {
-            // Always return in-memory data for today, even if total_active_secs is 0.
-            // The current session may have accumulated time not yet reflected in
-            // total_active_secs (only incremented on app switch).
-            let data = self.data.lock().unwrap().clone();
-            if data.date == date_str {
-                return Some(data);
-            }
-            return None;
+            return Some(self.data.lock().unwrap().clone());
         }
 
         // Load from archived file (prefers gzip)

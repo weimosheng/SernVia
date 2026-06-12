@@ -43,6 +43,7 @@ export function DetailsPage() {
   const [weekData, setWeekData] = useState<WeekData | null>(null);
   const [dayData, setDayData] = useState<ActivityData | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -56,11 +57,13 @@ export function DetailsPage() {
         const data = await invoke<WeekData>("get_stats_by_range_offset", {
           days: RANGE_DAYS[range],
           offsetDays,
+          range,
         });
         setWeekData(data);
         setDayData(null);
       }
     } catch (err) {
+      setError(String(err));
       console.error("Failed to fetch data:", err);
     }
   }, [range, offsetDays]);
@@ -107,6 +110,11 @@ export function DetailsPage() {
 
   return (
     <div className="p-6 space-y-6 max-w-5xl">
+      {error && (
+        <div className="rounded-md bg-destructive/10 border border-destructive p-4 text-sm text-destructive">
+          <strong>数据加载失败：</strong>{error}
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

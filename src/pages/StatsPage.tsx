@@ -83,6 +83,7 @@ export function StatsPage() {
   const [offsetDays, setOffsetDays] = useState(0);
   const [stats, setStats] = useState<WeekData | null>(null);
   const [barData, setBarData] = useState<CategoryBarEntry[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   // Global list of categories that actually appear in the data, with consistent colors
   // Each entry: { id, name, color, total_secs }
@@ -154,6 +155,7 @@ export function StatsPage() {
       setSelectedBarIdx(null);
       setFilteredData(null);
     } catch (err) {
+      setError(String(err));
       console.error("Failed to fetch stats:", err);
     }
   }, [range, offsetDays]);
@@ -239,6 +241,11 @@ export function StatsPage() {
 
   return (
     <div className="p-6 space-y-6 max-w-5xl">
+      {error && (
+        <div className="rounded-md bg-destructive/10 border border-destructive p-4 text-sm text-destructive">
+          <strong>数据加载失败：</strong>{error}
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

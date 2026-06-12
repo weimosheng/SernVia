@@ -210,7 +210,7 @@ export function CategoriesPage() {
             onClick={() => setRange(r)}
             className={`px-3 py-1.5 rounded-md text-sm border transition-colors ${
               range === r
-                ? "bg-primary text-white border-primary"
+                ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-muted border-muted-foreground/20"
             }`}
           >

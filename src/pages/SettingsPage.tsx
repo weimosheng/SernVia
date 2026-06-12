@@ -1642,7 +1642,7 @@ export function SettingsPage() {
         <CardContent className="space-y-4">
           <div className="flex items-center justify-between">
             <p className="text-sm font-medium">应用版本</p>
-            <p className="text-sm text-muted-foreground">v0.3.1</p>
+            <p className="text-sm text-muted-foreground">v0.3.2</p>
           </div>
           <Separator />
           <div className="flex items-center justify-between">
